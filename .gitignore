@@ -1,0 +1,5 @@
+node_modules/
+.bridge*.log
+secrets/*.env
+!.env.template
+!secrets/*.env.template
