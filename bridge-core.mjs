@@ -1,3 +1,5 @@
+import path from "node:path";
+
 export function parseCommand(text) {
   const trimmed = text.trim();
   if (trimmed === "/help" || trimmed === "帮助") return { type: "help" };
@@ -177,6 +179,50 @@ export function parseProjectChoices(value) {
       return { alias, path: item };
     })
     .filter((item) => item.alias && item.path);
+}
+
+export function extractThreadCwds(payload) {
+  const threads = payload?.result?.data || payload?.data;
+  if (!Array.isArray(threads)) return [];
+  return threads
+    .map((thread) => thread?.cwd)
+    .filter((cwd) => typeof cwd === "string" && cwd.trim())
+    .map((cwd) => cwd.trim());
+}
+
+export function mergeProjectChoices(baseChoices = [], discoveredPaths = []) {
+  const choices = [];
+  const seenPaths = new Set();
+  const usedAliases = new Set();
+
+  const addChoice = (alias, projectPath) => {
+    if (typeof projectPath !== "string" || !projectPath.trim()) return;
+    const normalizedPath = path.normalize(projectPath.trim());
+    const pathKey = normalizedPath.toLowerCase();
+    if (seenPaths.has(pathKey)) return;
+
+    let normalizedAlias = String(alias || path.basename(normalizedPath) || normalizedPath).trim();
+    if (!normalizedAlias) normalizedAlias = normalizedPath;
+    const aliasBase = normalizedAlias;
+    let suffix = 2;
+    while (usedAliases.has(normalizedAlias.toLowerCase())) {
+      normalizedAlias = `${aliasBase}-${suffix}`;
+      suffix += 1;
+    }
+
+    seenPaths.add(pathKey);
+    usedAliases.add(normalizedAlias.toLowerCase());
+    choices.push({ alias: normalizedAlias, path: normalizedPath });
+  };
+
+  for (const choice of Array.isArray(baseChoices) ? baseChoices : []) {
+    addChoice(choice?.alias, choice?.path);
+  }
+  for (const projectPath of Array.isArray(discoveredPaths) ? discoveredPaths : []) {
+    addChoice(path.basename(path.normalize(projectPath)), projectPath);
+  }
+
+  return choices;
 }
 
 export function cardProjectPathForAction({

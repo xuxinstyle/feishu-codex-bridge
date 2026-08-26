@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import * as bridgeCore from "../bridge-core.mjs";
 
@@ -6,6 +7,8 @@ import {
   codexConfigOverrideForReasoning,
   effectiveCodexModel,
   effectiveReasoningEffort,
+  extractThreadCwds,
+  mergeProjectChoices,
   parseCodexConfigDefaults,
   parseProjectChoices,
   parseCommand,
@@ -112,5 +115,45 @@ test("card actions prefer the chat's active project over a stale card project", 
       defaultProjectPath: "F:\\AIServer\\jx3-cs-services",
     }),
     "E:\\Stock_Analysis"
+  );
+});
+
+test("extractThreadCwds reads cwd values from thread/list result pages and ignores malformed threads", () => {
+  assert.deepEqual(
+    extractThreadCwds({
+      result: {
+        data: [
+          { id: "thread-1", cwd: "E:\\Stock_Analysis" },
+          { id: "thread-2", cwd: "" },
+          { id: "thread-3" },
+          { id: "thread-4", cwd: 42 },
+          { id: "thread-5", cwd: "F:/AIServer/jx3-wiki" },
+        ],
+        nextCursor: "next-page",
+      },
+    }),
+    ["E:\\Stock_Analysis", "F:/AIServer/jx3-wiki"]
+  );
+});
+
+test("mergeProjectChoices preserves configured projects and appends discovered paths once", () => {
+  assert.deepEqual(
+    mergeProjectChoices(
+      [
+        { alias: "cs", path: "F:\\AIServer\\jx3-cs-services" },
+        { alias: "stock", path: "E:\\Stock_Analysis" },
+      ],
+      [
+        "E:\\Stock_Analysis",
+        "F:\\AIServer\\jx3-wiki",
+        "F:\\AIServer\\jx3-wiki",
+        "",
+      ]
+    ),
+    [
+      { alias: "cs", path: "F:\\AIServer\\jx3-cs-services" },
+      { alias: "stock", path: "E:\\Stock_Analysis" },
+      { alias: "jx3-wiki", path: "F:\\AIServer\\jx3-wiki" },
+    ]
   );
 });

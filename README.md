@@ -108,6 +108,9 @@ Session 示例：
 |------|------|------|
 | `DEFAULT_PROJECT_PATH` | 当前仓根 | 默认让 Codex 执行的目录 |
 | `CODEX_PROJECTS` | 空 | 卡片项目候选，分号分隔，支持 `alias=path` |
+| `CODEX_PROJECT_DISCOVERY` | `thread-list` | 从 Codex App Server 的 `thread/list` 历史任务中发现项目；设为 `off` 可关闭 |
+| `CODEX_PROJECT_DISCOVERY_TIMEOUT` | `15000` | 单次项目发现超时，单位毫秒 |
+| `CODEX_PROJECT_DISCOVERY_INTERVAL` | `60000` | 后台刷新间隔，单位毫秒；设为 `0` 可关闭后台刷新 |
 | `CODEX_BIN` | `codex` | Codex CLI 命令 |
 | `CODEX_MODEL` | 空 | 留空则走 `~/.codex/config.toml` |
 | `CODEX_MODEL_CHOICES` | `gpt-5.5,gpt-5.4` | 卡片模型候选，逗号分隔 |
@@ -118,6 +121,14 @@ Session 示例：
 | `CODEX_DANGEROUS_BYPASS` | `0` | 显式设 `1` 才完全绕过审批和 sandbox |
 | `CODEX_CONFIG_OVERRIDES` | 空 | 分号分隔多个 `-c key=value` |
 | `SESSION_STATE_PATH` | `~/.feishu-codex-bridge/state.json` | session/threadId/active session 持久化文件 |
+项目候选的来源为：
+
+1. `DEFAULT_PROJECT_PATH` 和 `CODEX_PROJECTS` 中的手工配置；
+2. Codex App Server `thread/list` 返回的历史线程 `cwd`；
+3. 仅保留本机存在的目录，并按规范化绝对路径去重。
+
+桥接进程会在启动后、打开或查看项目面板时，以及后台刷新时执行发现。App Server 不可用时会记录 warning，但仍保留手工配置的项目，不影响桥接启动和任务执行。
+
 
 ## 注意
 

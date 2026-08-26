@@ -1,7 +1,7 @@
 import { Client, EventDispatcher, WSClient, normalizeCardAction } from "@larksuiteoapi/node-sdk";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -9,12 +9,14 @@ import {
   cardProjectPathForAction,
   effectiveCodexModel,
   effectiveReasoningEffort,
+  mergeProjectChoices,
   parseCodexConfigDefaults,
   parseCommand,
   parseProjectChoices,
   validateModelName,
   validateReasoningEffort,
 } from "./bridge-core.mjs";
+import { discoverCodexProjectPaths } from "./codex-projects.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
 const HOME_CONFIG_PATH = path.join(HOME_CONFIG_DIR, "config.env");
@@ -224,6 +226,9 @@ const config = {
   bridge: {
     defaultProjectPath: resolveProjectPath(optionalEnv("DEFAULT_PROJECT_PATH", homedir()), process.cwd()),
     sessionStatePath: resolveProjectPath(optionalEnv("SESSION_STATE_PATH", HOME_STATE_PATH), process.cwd()),
+    projectDiscovery: optionalEnv("CODEX_PROJECT_DISCOVERY", "thread-list").trim().toLowerCase(),
+    projectDiscoveryTimeout: optionalIntEnv("CODEX_PROJECT_DISCOVERY_TIMEOUT", 15_000),
+    projectDiscoveryInterval: optionalIntEnv("CODEX_PROJECT_DISCOVERY_INTERVAL", 60_000),
     streamPushInterval: optionalIntEnv("STREAM_PUSH_INTERVAL", 5000),
     logLevel: optionalEnv("LOG_LEVEL", "info"),
     allowedUserIds: parseListEnv("ALLOWED_USER_IDS"),
@@ -249,6 +254,7 @@ config.bridge.projectChoices = buildProjectChoices(
   config.bridge.defaultProjectPath,
   optionalEnv("CODEX_PROJECTS")
 );
+config.bridge.manualProjectChoices = config.bridge.projectChoices;
 const codexLauncher = resolveCodexLauncher(config.codex.bin);
 
 if (!existsSync(config.bridge.defaultProjectPath)) {
@@ -262,6 +268,68 @@ function log(level, message, data = undefined) {
   if (wanted < (current < 0 ? 1 : current)) return;
   const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
   console.log(`[${new Date().toISOString()}] [${level}] ${message}${suffix}`);
+}
+
+function isExistingDirectory(projectPath) {
+  try {
+    return existsSync(projectPath) && statSync(projectPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function normalizeDiscoveredProjectPaths(projectPaths) {
+  return [...new Set(
+    (Array.isArray(projectPaths) ? projectPaths : [])
+      .map((projectPath) => {
+        try {
+          return resolveProjectPath(projectPath, config.bridge.defaultProjectPath);
+        } catch {
+          return "";
+        }
+      })
+      .filter((projectPath) => projectPath && isExistingDirectory(projectPath))
+  )];
+}
+
+let projectRefreshPromise = null;
+
+async function refreshProjectChoices(reason = "manual") {
+  if (config.bridge.projectDiscovery !== "thread-list") return config.bridge.projectChoices;
+  if (projectRefreshPromise) return projectRefreshPromise;
+
+  projectRefreshPromise = (async () => {
+    try {
+      const discoveredPaths = normalizeDiscoveredProjectPaths(
+        await discoverCodexProjectPaths({
+          codexCommand: codexLauncher.command,
+          codexArgsPrefix: codexLauncher.argsPrefix,
+          shell: codexLauncher.shell,
+          timeoutMs: config.bridge.projectDiscoveryTimeout,
+        })
+      );
+      config.bridge.projectChoices = mergeProjectChoices(
+        config.bridge.manualProjectChoices,
+        discoveredPaths
+      );
+      log("info", "project choices refreshed from Codex thread history", {
+        reason,
+        discoveredCount: discoveredPaths.length,
+        totalCount: config.bridge.projectChoices.length,
+      });
+    } catch (error) {
+      config.bridge.projectChoices = config.bridge.manualProjectChoices;
+      log("warn", "failed to refresh project choices from Codex thread history", {
+        reason,
+        error: String(error),
+      });
+    } finally {
+      projectRefreshPromise = null;
+    }
+    return config.bridge.projectChoices;
+  })();
+
+  return projectRefreshPromise;
 }
 
 function saveAllowedUserId(userId) {
@@ -1350,6 +1418,9 @@ async function handleMessage(message) {
     await messenger.replyText(message.messageId, getHelpMessage());
     return;
   }
+  if (command.type === "panel" || command.type === "project") {
+    await refreshProjectChoices(command.type);
+  }
   const activeProjectPath = runner.activeProjectPath(message.chatId);
   if (command.type === "panel") {
     await messenger.replyCard(
@@ -1537,6 +1608,9 @@ async function handleCardAction(raw) {
     log("warn", "card action missing chat scope", { action: value.action, event });
     return;
   }
+  if (["refresh", "show_sessions", "set_project"].includes(value.action)) {
+    await refreshProjectChoices(`card:${value.action}`);
+  }
   const projectPath = cardProjectPathForAction({
     activeProjectPath: runner.activeProjectPath(actionChatId),
     cardProjectPath,
@@ -1652,8 +1726,22 @@ log("info", "starting Feishu Codex bridge", {
 await wsClient.start({ eventDispatcher: dispatcher });
 log("info", "Feishu WebSocket connected; waiting for messages");
 
+await refreshProjectChoices("startup");
+let projectRefreshTimer = null;
+if (
+  config.bridge.projectDiscovery === "thread-list" &&
+  config.bridge.projectDiscoveryInterval > 0
+) {
+  projectRefreshTimer = setInterval(() => {
+    refreshProjectChoices("interval").catch((error) => {
+      log("warn", "periodic project discovery failed", { error: String(error) });
+    });
+  }, config.bridge.projectDiscoveryInterval);
+}
+
 function shutdown(signal) {
   log("info", "shutting down", { signal });
+  if (projectRefreshTimer) clearInterval(projectRefreshTimer);
   runner.killActive();
   process.exit(0);
 }
