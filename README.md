@@ -39,6 +39,39 @@ tool/feishu-codex-bridge/start.ps1
 
 首次启动时终端会显示配对码，把配对码发给飞书机器人即可绑定。
 
+## 开机自动启动
+
+桥接依赖当前 Windows 用户的 Codex 配置和登录状态，因此自动启动任务会在该用户登录后运行，而不是使用 `SYSTEM` 账户。
+
+安装自动启动任务：
+
+```powershell
+.\autostart.ps1 Install
+```
+
+任务会在登录后延迟约 20 秒隐藏启动；异常退出时最多自动重试 10 次。当前 bridge 已手工运行时无需停止，安装命令不会立即启动第二个实例，下次登录时自动生效。
+
+查看状态或卸载：
+
+```powershell
+.\autostart.ps1 Status
+.\autostart.ps1 Uninstall
+```
+
+需要安装后立即启动时使用：
+
+```powershell
+.\autostart.ps1 Install -StartNow
+```
+
+后台日志写入：
+
+```text
+~/.feishu-codex-bridge/logs/bridge.log
+```
+
+日志达到 10 MB 后会轮换为 `bridge.previous.log`。如果移动了仓库目录，需要重新执行安装命令以更新任务中的脚本路径。
+
 ## 命令
 
 | 指令 | 说明 |

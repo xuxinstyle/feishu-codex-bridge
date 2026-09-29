@@ -104,4 +104,28 @@ Describe "Feishu Codex Bridge PowerShell scripts" {
 
         Test-Path (Join-Path $script:bridgeDir "secrets\feishu_codex_bridge.env") | Should Be $true
     }
+
+    It "defines a current-user scheduled task for bridge autostart" {
+        $source = Get-Content -Raw (Join-Path $PSScriptRoot "..\autostart.ps1")
+
+        { [scriptblock]::Create($source) } | Should Not Throw
+        $source | Should Match "New-ScheduledTaskTrigger"
+        $source | Should Match "-AtLogOn"
+        $source | Should Match "New-ScheduledTaskPrincipal"
+        $source | Should Match "-LogonType Interactive"
+        $source | Should Match "run-background\.ps1"
+        $source | Should Match "Unregister-ScheduledTask"
+    }
+
+    It "runs the bridge in the background and writes its output to the user log directory" {
+        Copy-Item (Join-Path $PSScriptRoot "..\run-background.ps1") $script:bridgeDir
+        Set-Content -Encoding utf8 (Join-Path $script:bridgeDir "start.ps1") 'Write-Output "bridge-started"'
+
+        & (Join-Path $script:bridgeDir "run-background.ps1")
+
+        $logPath = Join-Path $script:profileDir ".feishu-codex-bridge\logs\bridge.log"
+        Test-Path $logPath | Should Be $true
+        (Get-Content -Raw $logPath) | Should Match "bridge-started"
+        (Get-Content -Raw $logPath) | Should Match "Bridge stopped with exit code 0"
+    }
 }

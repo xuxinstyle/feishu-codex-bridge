@@ -170,6 +170,7 @@ Write-Host "1. Edit $SecretsFile"
 Write-Host "2. Configure Feishu bot per tool/feishu-codex-bridge/FEISHU_APP_SETUP.md"
 Write-Host "3. Run: codex login"
 Write-Host "4. Re-run setup.ps1, then start.ps1"
+Write-Host "5. Optional: run autostart.ps1 Install to start automatically after sign-in"
 if (-not $configReady) {
     exit 2
 }

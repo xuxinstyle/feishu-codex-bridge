@@ -9,6 +9,7 @@ import {
   buildImageArgs,
   canResumeCodexSession,
   codexConfigOverrideForReasoning,
+  createMessageDeduper,
   effectiveCodexModel,
   effectiveReasoningEffort,
   extractThreadCwds,
@@ -220,6 +221,17 @@ test("panel command always replies with a new card", () => {
   assert.doesNotMatch(match[0], /messenger\.updateCard\(/);
 });
 
+test("panel command replies before refreshing project history", () => {
+  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8");
+  const match = source.match(
+    /if \(command\.type === "panel"\) \{[\s\S]*?\n  \}\n  if \(command\.type === "project"\)/
+  );
+  assert.ok(match, "panel command branch should be present");
+  assert.match(match[0], /await showControlCard/);
+  assert.match(match[0], /refreshProjectChoices\("panel"\)/);
+  assert.doesNotMatch(match[0], /await refreshProjectChoices\("panel"\)/);
+});
+
 test("extractThreadCwds reads cwd values from thread/list result pages and ignores malformed threads", () => {
   assert.deepEqual(
     extractThreadCwds({
@@ -290,6 +302,26 @@ test("same-card actions run serially so later model redraw cannot be overwritten
     "model:start",
     "model:end",
   ]);
+});
+
+test("message deduper suppresses retries and allows failed messages to be released", () => {
+  let currentTime = 1000;
+  const deduper = createMessageDeduper({
+    now: () => currentTime,
+    ttlMs: 100,
+    maxEntries: 2,
+  });
+
+  assert.equal(deduper.claim("om-message-1"), true);
+  assert.equal(deduper.claim("om-message-1"), false);
+  assert.deepEqual(deduper.snapshot(), [["om-message-1", 1000]]);
+
+  deduper.release("om-message-1");
+  assert.equal(deduper.claim("om-message-1"), true);
+
+  currentTime = 1201;
+  assert.equal(deduper.claim("om-message-2"), true);
+  assert.deepEqual(deduper.snapshot(), [["om-message-2", 1201]]);
 });
 
 test("Feishu card patch responses with non-zero codes are rejected", () => {

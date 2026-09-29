@@ -304,6 +304,51 @@ export function createKeyedSerialExecutor() {
   };
 }
 
+export function createMessageDeduper({
+  initialEntries = [],
+  maxEntries = 512,
+  ttlMs = 24 * 60 * 60 * 1000,
+  now = () => Date.now(),
+} = {}) {
+  const entries = new Map();
+  for (const item of Array.isArray(initialEntries) ? initialEntries : []) {
+    if (!Array.isArray(item) || item.length < 2) continue;
+    const messageId = String(item[0] || "").trim();
+    const timestamp = Number(item[1]);
+    if (messageId && Number.isFinite(timestamp)) entries.set(messageId, timestamp);
+  }
+
+  function prune() {
+    const cutoff = now() - ttlMs;
+    for (const [messageId, timestamp] of entries) {
+      if (timestamp < cutoff) entries.delete(messageId);
+    }
+    while (entries.size > maxEntries) {
+      entries.delete(entries.keys().next().value);
+    }
+  }
+
+  return {
+    claim(messageId) {
+      const normalized = String(messageId || "").trim();
+      if (!normalized) return true;
+      prune();
+      if (entries.has(normalized)) return false;
+      entries.set(normalized, now());
+      prune();
+      return true;
+    },
+    release(messageId) {
+      const normalized = String(messageId || "").trim();
+      if (normalized) entries.delete(normalized);
+    },
+    snapshot() {
+      prune();
+      return [...entries.entries()];
+    },
+  };
+}
+
 export function assertFeishuApiSuccess(response, operation = "飞书 API") {
   const code = response?.code;
   if (response && (code === undefined || code === 0)) return response;

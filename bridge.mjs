@@ -13,6 +13,7 @@ import {
   codexConfigOverrideForReasoning,
   cardProjectPathForAction,
   createKeyedSerialExecutor,
+  createMessageDeduper,
   effectiveCodexModel,
   effectiveReasoningEffort,
   mergeProjectChoices,
@@ -416,6 +417,7 @@ function parseMessageEvent(data) {
     }
     const text = stripFeishuMentions(rawText);
     return {
+      eventId: data?.event_id || data?.event?.event_id || "",
       messageId: message.message_id,
       chatId: message.chat_id,
       chatType: message.chat_type,
@@ -825,6 +827,9 @@ class TaskRunner {
     this.modelOverrides = new Map(Array.isArray(state.modelOverrides) ? state.modelOverrides : []);
     this.reasoningOverrides = new Map(Array.isArray(state.reasoningOverrides) ? state.reasoningOverrides : []);
     this.controlCards = new Map(Array.isArray(state.controlCards) ? state.controlCards : []);
+    this.messageDeduper = createMessageDeduper({
+      initialEntries: state.handledMessageIds,
+    });
     this.sessionResetAt = new Map();
     this.activeTasks = new Map();
     this.sessionQueues = new Map();
@@ -841,7 +846,19 @@ class TaskRunner {
       modelOverrides: [...this.modelOverrides.entries()],
       reasoningOverrides: [...this.reasoningOverrides.entries()],
       controlCards: [...this.controlCards.entries()],
+      handledMessageIds: this.messageDeduper.snapshot(),
     });
+  }
+
+  claimMessage(messageId) {
+    const claimed = this.messageDeduper.claim(messageId);
+    if (claimed && messageId) this.persistSessionState();
+    return claimed;
+  }
+
+  releaseMessage(messageId) {
+    this.messageDeduper.release(messageId);
+    if (messageId) this.persistSessionState();
   }
 
   markKnownSession(chatId, projectPath, sessionName) {
@@ -1496,6 +1513,8 @@ if (pairingCode) {
 
 async function handleMessage(message) {
   log("info", "message received", {
+    eventId: message.eventId,
+    messageId: message.messageId,
     senderId: message.senderId,
     chatId: message.chatId,
     chatType: message.chatType,
@@ -1523,12 +1542,26 @@ async function handleMessage(message) {
     await messenger.replyText(message.messageId, getHelpMessage());
     return;
   }
-  if (command.type === "panel" || command.type === "project") {
-    await refreshProjectChoices(command.type);
-  }
   if (command.type === "panel") {
-    await showControlCard(message.chatId, message.messageId, "控制卡片已打开");
+    const cardMessageId = await showControlCard(message.chatId, message.messageId, "控制卡片已打开");
+    refreshProjectChoices("panel")
+      .then(async () => {
+        if (!cardMessageId || runner.controlCardMessageId(message.chatId) !== cardMessageId) return;
+        await messenger.updateCard(
+          cardMessageId,
+          buildControlCard(
+            runner,
+            message.chatId,
+            runner.activeProjectPath(message.chatId),
+            "项目列表已刷新"
+          )
+        );
+      })
+      .catch((error) => log("warn", "background panel project refresh failed", { error: String(error) }));
     return;
+  }
+  if (command.type === "project") {
+    await refreshProjectChoices("project");
   }
   const activeProjectPath = runner.activeProjectPath(message.chatId);
   if (command.type === "sessions") {
@@ -1813,10 +1846,20 @@ const dispatcher = new EventDispatcher({}).register({
     });
     const parsed = parseMessageEvent(data);
     if (!parsed) return;
+    if (!runner.claimMessage(parsed.messageId)) {
+      log("warn", "ignored duplicate message event", {
+        eventId: parsed.eventId,
+        messageId: parsed.messageId,
+        chatId: parsed.chatId,
+        text: parsed.text.slice(0, 120),
+      });
+      return;
+    }
     try {
       await handleMessage(parsed);
     } catch (error) {
       log("error", "message handler failed", { error: String(error) });
+      runner.releaseMessage(parsed.messageId);
       try {
         await messenger.replyText(parsed.messageId, `处理消息失败: ${String(error)}`);
       } catch {
