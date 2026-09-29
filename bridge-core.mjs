@@ -89,6 +89,68 @@ export function validateModelName(value) {
   return { ok: true, model };
 }
 
+const DEFAULT_GROK_MODELS = ["grok-4.6", "grok-4.5"];
+
+function uniqueModelList(items) {
+  const seen = new Set();
+  const models = [];
+  for (const item of items) {
+    const validation = validateModelName(item);
+    if (!validation.ok || seen.has(validation.model)) continue;
+    seen.add(validation.model);
+    models.push(validation.model);
+  }
+  return models;
+}
+
+export function buildModelChoiceGroups({
+  configuredChoices = [],
+  configuredModel = "",
+  defaultModel = "",
+} = {}) {
+  const all = uniqueModelList([
+    ...DEFAULT_GROK_MODELS,
+    ...configuredChoices,
+    configuredModel,
+    defaultModel,
+  ]);
+  return {
+    grok: all.filter((model) => /^grok(?:-|$)/i.test(model)),
+    codex: all.filter((model) => !/^grok(?:-|$)/i.test(model)),
+  };
+}
+
+export function buildModelArgs({
+  configuredModel = "",
+  defaultModel = "",
+  scopedModel = "",
+} = {}) {
+  const model = effectiveCodexModel({ configuredModel, defaultModel, scopedModel });
+  return model ? ["-m", model] : [];
+}
+
+export function buildImageArgs(imagePath = "") {
+  const normalizedPath = String(imagePath || "").trim();
+  return normalizedPath ? ["-i", normalizedPath] : [];
+}
+
+export function parseFeishuImageContent(content) {
+  try {
+    const parsed = JSON.parse(String(content || "{}"));
+    const imageKey = typeof parsed?.image_key === "string" ? parsed.image_key.trim() : "";
+    return { imageKey };
+  } catch {
+    return { imageKey: "" };
+  }
+}
+
+export function canResumeCodexSession({ session = null, model = "" } = {}) {
+  const threadId = typeof session?.threadId === "string" ? session.threadId.trim() : "";
+  const storedModel = typeof session?.model === "string" ? session.model.trim() : "";
+  const requestedModel = String(model || "").trim();
+  return Boolean(threadId && storedModel && requestedModel && storedModel === requestedModel);
+}
+
 const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
 export function normalizeReasoningEffort(value) {
@@ -223,6 +285,34 @@ export function mergeProjectChoices(baseChoices = [], discoveredPaths = []) {
   }
 
   return choices;
+}
+
+export function shouldRefreshProjectChoicesForCardAction(action) {
+  return action === "refresh" || action === "show_sessions";
+}
+
+export function createKeyedSerialExecutor() {
+  const tails = new Map();
+  return function execute(key, task) {
+    const queueKey = String(key || "");
+    const previous = tails.get(queueKey) || Promise.resolve();
+    const current = previous.catch(() => {}).then(task);
+    tails.set(queueKey, current);
+    return current.finally(() => {
+      if (tails.get(queueKey) === current) tails.delete(queueKey);
+    });
+  };
+}
+
+export function assertFeishuApiSuccess(response, operation = "飞书 API") {
+  const code = response?.code;
+  if (response && (code === undefined || code === 0)) return response;
+  const message = response?.msg || "unknown error";
+  throw new Error(`${operation}失败: code=${code ?? "unknown"} msg=${message}`);
+}
+
+export function isStaleControlCardAction({ currentMessageId = "", actionMessageId = "" } = {}) {
+  return Boolean(currentMessageId && actionMessageId && currentMessageId !== actionMessageId);
 }
 
 export function cardProjectPathForAction({

@@ -1,18 +1,27 @@
 import { Client, EventDispatcher, WSClient, normalizeCardAction } from "@larksuiteoapi/node-sdk";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
+  assertFeishuApiSuccess,
+  buildImageArgs,
+  buildModelArgs,
+  buildModelChoiceGroups,
+  canResumeCodexSession,
   codexConfigOverrideForReasoning,
   cardProjectPathForAction,
+  createKeyedSerialExecutor,
   effectiveCodexModel,
   effectiveReasoningEffort,
   mergeProjectChoices,
   parseCodexConfigDefaults,
+  parseFeishuImageContent,
   parseCommand,
   parseProjectChoices,
+  shouldRefreshProjectChoicesForCardAction,
+  isStaleControlCardAction,
   validateModelName,
   validateReasoningEffort,
 } from "./bridge-core.mjs";
@@ -234,13 +243,15 @@ const config = {
     allowedUserIds: parseListEnv("ALLOWED_USER_IDS"),
   },
 };
-config.codex.modelChoices = uniqueList([
-  ...parseListEnv("CODEX_MODEL_CHOICES"),
-  config.codex.model,
-  config.codex.defaultModel,
-  "gpt-5.5",
-  "gpt-5.4",
-]);
+config.codex.modelGroups = buildModelChoiceGroups({
+  configuredChoices: [
+    ...parseListEnv("CODEX_MODEL_CHOICES"),
+    "gpt-5.5",
+    "gpt-5.4",
+  ],
+  configuredModel: config.codex.model,
+  defaultModel: config.codex.defaultModel,
+});
 config.codex.reasoningEffortChoices = uniqueList(
   [
     ...(parseListEnv("CODEX_REASONING_EFFORT_CHOICES").length > 0
@@ -377,8 +388,8 @@ function parseMessageEvent(data) {
       });
       return null;
     }
-    if (message.message_type !== "text") {
-      log("info", "ignored non-text message", {
+    if (!['text', 'image'].includes(message.message_type)) {
+      log("info", "ignored unsupported message type", {
         messageId: message.message_id,
         messageType: message.message_type,
         chatId: message.chat_id,
@@ -386,10 +397,22 @@ function parseMessageEvent(data) {
       return null;
     }
     let rawText = "";
-    try {
-      rawText = JSON.parse(message.content || "{}").text || "";
-    } catch {
-      rawText = message.content || "";
+    let imageKey = "";
+    if (message.message_type === "image") {
+      imageKey = parseFeishuImageContent(message.content).imageKey;
+      if (!imageKey) {
+        log("warn", "ignored image message without image_key", {
+          messageId: message.message_id,
+          chatId: message.chat_id,
+        });
+        return null;
+      }
+    } else {
+      try {
+        rawText = JSON.parse(message.content || "{}").text || "";
+      } catch {
+        rawText = message.content || "";
+      }
     }
     const text = stripFeishuMentions(rawText);
     return {
@@ -399,6 +422,7 @@ function parseMessageEvent(data) {
       senderId: sender?.sender_id?.open_id || "unknown",
       text,
       rawText,
+      imageKey,
       raw: data,
     };
   } catch (error) {
@@ -417,6 +441,7 @@ function getHelpMessage() {
     "- /panel：发送按钮控制卡片",
     "- /run <描述>：在默认仓库执行",
     "- /run <路径> <描述>：指定仓库或目录执行",
+    "- 直接发送图片：下载图片后交给 Codex 通过 -i 参数分析",
     "- 连续发送多个任务会排队执行，不会自动取消前一个任务",
     "- /sessions：查看当前仓库的 Codex session",
     "- /use <名字>：切换当前聊天窗口的 active session",
@@ -424,6 +449,7 @@ function getHelpMessage() {
     "- /new：清除当前 active session 映射",
     "- /model：查看当前聊天窗口的模型覆盖",
     "- /model <模型名>：切换当前聊天窗口后续任务使用的模型，例如 /model gpt-5.5",
+    "- /panel：面板提供 grok-4.6、grok-4.5 和配置的 Codex/provider 模型按钮；其他模型可直接用 /model <模型名>",
     "- /model <模型名> <推理强度>：同时切换模型和推理强度，例如 /model gpt-5.5 high",
     "- /model default：清除模型覆盖，回到 CODEX_MODEL 或 ~/.codex/config.toml",
     "- /reasoning <low|medium|high|xhigh|max|ultra>：切换当前项目的推理强度",
@@ -487,6 +513,19 @@ class FeishuMessenger {
     return res?.data?.message_id;
   }
 
+  async downloadMessageResource(messageId, fileKey, filePath) {
+    const resource = await this.client.im.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type: "image" },
+    });
+    await resource.writeFile(filePath);
+    const contentTypeHeader = resource.headers?.["content-type"] || resource.headers?.["Content-Type"] || "";
+    return {
+      filePath,
+      contentType: String(contentTypeHeader).split(";", 1)[0].trim().toLowerCase(),
+    };
+  }
+
   async updateText(messageId, text) {
     await this.client.im.message.update({
       path: { message_id: messageId },
@@ -498,12 +537,14 @@ class FeishuMessenger {
   }
 
   async updateCard(messageId, card) {
-    await this.client.im.message.patch({
+    const res = await this.client.im.message.patch({
       path: { message_id: messageId },
       data: {
         content: JSON.stringify(card),
       },
     });
+    assertFeishuApiSuccess(res, "更新飞书卡片");
+    return res;
   }
 }
 
@@ -647,9 +688,8 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "sess
         item.path === projectPath ? "primary" : "default"
       )
     );
-  const modelButtons = config.codex.modelChoices
-    .slice(0, 8)
-    .map((model) =>
+  const modelButtons = (models) =>
+    models.slice(0, 8).map((model) =>
       scopedButton(
         model === modelText ? `当前 ${model}` : `模型 ${model}`,
         "set_model",
@@ -657,6 +697,8 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "sess
         model === modelText ? "primary" : "default"
       )
     );
+  const grokButtons = modelButtons(config.codex.modelGroups.grok);
+  const codexButtons = modelButtons(config.codex.modelGroups.codex);
   const reasoningButtons = config.codex.reasoningEffortChoices
     .slice(0, 8)
     .map((effort) =>
@@ -707,8 +749,10 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "sess
       { tag: "hr" },
       { tag: "markdown", content: "**projects**" },
       projectButtons.length > 0 ? { tag: "action", layout: "flow", actions: projectButtons } : null,
-      { tag: "markdown", content: "**models**" },
-      modelButtons.length > 0 ? { tag: "action", layout: "flow", actions: modelButtons } : null,
+      { tag: "markdown", content: "**Grok models**" },
+      grokButtons.length > 0 ? { tag: "action", layout: "flow", actions: grokButtons } : null,
+      { tag: "markdown", content: "**Codex/provider models**" },
+      codexButtons.length > 0 ? { tag: "action", layout: "flow", actions: codexButtons } : null,
       { tag: "markdown", content: "**reasoning effort**" },
       reasoningButtons.length > 0 ? { tag: "action", layout: "flow", actions: reasoningButtons } : null,
       { tag: "hr" },
@@ -722,7 +766,8 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "sess
         elements: [
           {
             tag: "plain_text",
-            content: "项目、模型和推理强度只影响后续任务；要自定义 session 名称可发送 /new 名字。",
+            content:
+              "项目、模型和推理强度只影响后续任务；面板列出 Grok 预设和 Codex/provider 候选。要使用其他已配置模型可发送 /model <模型名>；要自定义 session 名称可发送 /new 名字。",
           },
         ],
       },
@@ -779,6 +824,7 @@ class TaskRunner {
     this.knownSessions = new Set(Array.isArray(state.knownSessions) ? state.knownSessions : []);
     this.modelOverrides = new Map(Array.isArray(state.modelOverrides) ? state.modelOverrides : []);
     this.reasoningOverrides = new Map(Array.isArray(state.reasoningOverrides) ? state.reasoningOverrides : []);
+    this.controlCards = new Map(Array.isArray(state.controlCards) ? state.controlCards : []);
     this.sessionResetAt = new Map();
     this.activeTasks = new Map();
     this.sessionQueues = new Map();
@@ -794,6 +840,7 @@ class TaskRunner {
       knownSessions: [...this.knownSessions],
       modelOverrides: [...this.modelOverrides.entries()],
       reasoningOverrides: [...this.reasoningOverrides.entries()],
+      controlCards: [...this.controlCards.entries()],
     });
   }
 
@@ -851,6 +898,23 @@ class TaskRunner {
 
   clearActiveProject(chatId) {
     const existed = this.activeProjects.delete(chatId);
+    this.persistSessionState();
+    return existed;
+  }
+
+  controlCardMessageId(chatId) {
+    return this.controlCards.get(chatId) || "";
+  }
+
+  setControlCardMessageId(chatId, messageId) {
+    if (!chatId || !messageId) return "";
+    this.controlCards.set(chatId, messageId);
+    this.persistSessionState();
+    return messageId;
+  }
+
+  clearControlCardMessageId(chatId) {
+    const existed = this.controlCards.delete(chatId);
     this.persistSessionState();
     return existed;
   }
@@ -1064,7 +1128,7 @@ class TaskRunner {
       });
   }
 
-  async create(source, projectPath, prompt, sessionName) {
+  async create(source, projectPath, prompt, sessionName, imageKey = "") {
     const normalizedSessionName = normalizeSessionName(sessionName);
     const ahead = this.pendingCountForSession(source.chatId, projectPath, normalizedSessionName);
     const task = {
@@ -1073,6 +1137,7 @@ class TaskRunner {
       projectPath,
       sessionName: normalizedSessionName,
       prompt,
+      imageKey,
       status: "pending",
       createdAt: Date.now(),
       startedAt: null,
@@ -1084,6 +1149,7 @@ class TaskRunner {
       lastEventAt: null,
       modelOverride: this.modelOverride(source.chatId, projectPath),
       reasoningOverride: this.reasoningOverride(source.chatId, projectPath),
+      model: this.effectiveModel(source.chatId, projectPath),
     };
     this.tasks.set(task.taskId, task);
     try {
@@ -1106,13 +1172,14 @@ class TaskRunner {
   buildArgs(task, lastMessageFile) {
     const existing = this.sessions.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
     const args = [];
-    if (existing?.threadId) {
+    if (canResumeCodexSession({ session: existing, model: task.model })) {
       args.push("exec", "resume", "--json", "-o", lastMessageFile);
       this.appendCodexOptions(args, {
         isResume: true,
         modelOverride: task.modelOverride,
         reasoningOverride: task.reasoningOverride,
       });
+      args.push(...buildImageArgs(task.imagePath));
       args.push(existing.threadId, "-");
       return args;
     }
@@ -1122,22 +1189,22 @@ class TaskRunner {
       modelOverride: task.modelOverride,
       reasoningOverride: task.reasoningOverride,
     });
+    args.push(...buildImageArgs(task.imagePath));
     args.push("-");
     return args;
   }
 
   appendCodexOptions(args, { isResume, modelOverride = "", reasoningOverride = "" }) {
-    const model = effectiveCodexModel({
+    args.push(...buildModelArgs({
       configuredModel: config.codex.model,
       defaultModel: config.codex.defaultModel,
       scopedModel: modelOverride,
-    });
+    }));
     const reasoningEffort = effectiveReasoningEffort({
       configuredEffort: config.codex.reasoningEffort,
       defaultEffort: config.codex.defaultReasoningEffort,
       scopedEffort: reasoningOverride,
     });
-    if (model) args.push("-m", model);
     if (config.codex.profile) args.push("-p", config.codex.profile);
     for (const override of config.codex.configOverrides) {
       args.push("-c", override);
@@ -1163,6 +1230,7 @@ class TaskRunner {
     task.startedAt = Date.now();
     task.lastEventAt = task.startedAt;
     const lastMessageFile = path.join(tmpdir(), `feishu-codex-${task.taskId}.txt`);
+    let imageDownloadPath = "";
     let pushTimer = null;
     let lastPushed = "";
 
@@ -1199,6 +1267,30 @@ class TaskRunner {
       pushTimer = setInterval(() => {
         push(false).catch((error) => log("warn", "periodic push failed", { error: String(error) }));
       }, config.bridge.streamPushInterval);
+
+      if (task.imageKey) {
+        imageDownloadPath = path.join(tmpdir(), `feishu-codex-${task.taskId}-image.download`);
+        const downloaded = await this.messenger.downloadMessageResource(
+          task.source.messageId,
+          task.imageKey,
+          imageDownloadPath
+        );
+        const extensionByType = {
+          "image/jpeg": ".jpg",
+          "image/png": ".png",
+          "image/gif": ".gif",
+          "image/webp": ".webp",
+          "image/bmp": ".bmp",
+        };
+        const extension = extensionByType[downloaded.contentType] || ".png";
+        task.imagePath = imageDownloadPath.replace(/\.download$/, extension);
+        renameSync(imageDownloadPath, task.imagePath);
+        log("info", "downloaded Feishu image", {
+          taskId: task.taskId,
+          contentType: downloaded.contentType || "unknown",
+          imagePath: task.imagePath,
+        });
+      }
 
       const args = this.buildArgs(task, lastMessageFile);
       const spawnArgs = [...codexLauncher.argsPrefix, ...args];
@@ -1305,6 +1397,7 @@ class TaskRunner {
             this.sessions.set(key, {
               name: task.sessionName,
               threadId,
+              model: task.model,
               projectPath: task.projectPath,
               turns: (existing?.turns || 0) + 1,
               updatedAt: new Date().toISOString(),
@@ -1346,6 +1439,8 @@ class TaskRunner {
       log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) });
     }
     rmSync(lastMessageFile, { force: true });
+    if (imageDownloadPath) rmSync(imageDownloadPath, { force: true });
+    if (task.imagePath) rmSync(task.imagePath, { force: true });
     log("info", "task finished", { taskId: task.taskId, status: task.status, seconds });
   }
   }
@@ -1382,6 +1477,14 @@ const runner = new TaskRunner(messenger);
 const allowedUserIds = new Set(config.bridge.allowedUserIds);
 let pairingCode = allowedUserIds.size === 0 ? makePairingCode() : null;
 
+async function showControlCard(chatId, replyToMessageId, notice = "") {
+  const projectPath = runner.activeProjectPath(chatId);
+  const card = buildControlCard(runner, chatId, projectPath, notice);
+  const messageId = await messenger.replyCard(replyToMessageId, card);
+  if (messageId) runner.setControlCardMessageId(chatId, messageId);
+  return messageId;
+}
+
 if (pairingCode) {
   log("info", "pairing required", {
     pairingCode,
@@ -1413,7 +1516,9 @@ async function handleMessage(message) {
     return;
   }
 
-  const command = parseCommand(message.text);
+  const command = message.imageKey
+    ? { type: "run", prompt: message.text || "请分析这张图片并回答。" }
+    : parseCommand(message.text);
   if (command.type === "help") {
     await messenger.replyText(message.messageId, getHelpMessage());
     return;
@@ -1421,14 +1526,11 @@ async function handleMessage(message) {
   if (command.type === "panel" || command.type === "project") {
     await refreshProjectChoices(command.type);
   }
-  const activeProjectPath = runner.activeProjectPath(message.chatId);
   if (command.type === "panel") {
-    await messenger.replyCard(
-      message.messageId,
-      buildControlCard(runner, message.chatId, activeProjectPath, "控制卡片已打开")
-    );
+    await showControlCard(message.chatId, message.messageId, "控制卡片已打开");
     return;
   }
+  const activeProjectPath = runner.activeProjectPath(message.chatId);
   if (command.type === "sessions") {
     await messenger.replyText(message.messageId, runner.sessionInfo(message.chatId, activeProjectPath));
     return;
@@ -1574,10 +1676,13 @@ async function handleMessage(message) {
     },
     projectPath,
     command.prompt,
-    sessionName
+    sessionName,
+    message.imageKey
   );
   log("info", "task queued", { taskId: task.taskId, projectPath, sessionName: task.sessionName });
 }
+
+const executeCardActionSerially = createKeyedSerialExecutor();
 
 async function handleCardAction(raw) {
   const event = normalizeCardAction(raw, { includeRaw: true });
@@ -1587,6 +1692,10 @@ async function handleCardAction(raw) {
     });
     return;
   }
+  return executeCardActionSerially(event.messageId, () => handleNormalizedCardAction(event));
+}
+
+async function handleNormalizedCardAction(event) {
   if (allowedUserIds.size > 0 && !allowedUserIds.has(event.operator.openId)) {
     log("warn", "ignored unauthorized card action", { senderId: event.operator.openId });
     return;
@@ -1608,7 +1717,25 @@ async function handleCardAction(raw) {
     log("warn", "card action missing chat scope", { action: value.action, event });
     return;
   }
-  if (["refresh", "show_sessions", "set_project"].includes(value.action)) {
+  const currentCardMessageId = runner.controlCardMessageId(actionChatId);
+  if (
+    isStaleControlCardAction({
+      currentMessageId: currentCardMessageId,
+      actionMessageId: event.messageId,
+    })
+  ) {
+    log("warn", "ignored action from stale control card", {
+      action: value.action,
+      actionMessageId: event.messageId,
+      currentCardMessageId,
+      chatId: actionChatId,
+    });
+    return;
+  }
+  if (!currentCardMessageId) {
+    runner.setControlCardMessageId(actionChatId, event.messageId);
+  }
+  if (shouldRefreshProjectChoicesForCardAction(value.action)) {
     await refreshProjectChoices(`card:${value.action}`);
   }
   const projectPath = cardProjectPathForAction({

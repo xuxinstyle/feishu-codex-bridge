@@ -4,16 +4,22 @@ import { test } from "node:test";
 import * as bridgeCore from "../bridge-core.mjs";
 
 import {
+  buildModelArgs,
+  buildModelChoiceGroups,
+  buildImageArgs,
+  canResumeCodexSession,
   codexConfigOverrideForReasoning,
   effectiveCodexModel,
   effectiveReasoningEffort,
   extractThreadCwds,
   mergeProjectChoices,
+  parseFeishuImageContent,
   parseCodexConfigDefaults,
   parseProjectChoices,
   parseCommand,
   validateReasoningEffort,
   validateModelName,
+  shouldRefreshProjectChoicesForCardAction,
 } from "../bridge-core.mjs";
 
 test("parseCommand recognizes model show, set, and default commands", () => {
@@ -118,6 +124,102 @@ test("card actions prefer the chat's active project over a stale card project", 
   );
 });
 
+test("buildModelChoiceGroups exposes Grok presets and preserves configured Codex models", () => {
+  assert.deepEqual(buildModelChoiceGroups({
+    configuredChoices: ["gpt-5.6-sol", "grok-4.6", "gpt-5.6-sol"],
+    configuredModel: "gpt-5.5",
+    defaultModel: "gpt-5.6-sol",
+  }), {
+    grok: ["grok-4.6", "grok-4.5"],
+    codex: ["gpt-5.6-sol", "gpt-5.5"],
+  });
+});
+
+test("buildModelChoiceGroups keeps arbitrary configured provider models selectable", () => {
+  const groups = buildModelChoiceGroups({
+    configuredChoices: ["custom/provider-model"],
+    configuredModel: "",
+    defaultModel: "",
+  });
+  assert.deepEqual(groups.grok, ["grok-4.6", "grok-4.5"]);
+  assert.deepEqual(groups.codex, ["custom/provider-model"]);
+});
+
+test("selected Grok model becomes the Codex CLI model argument", () => {
+  assert.deepEqual(buildModelArgs({
+    configuredModel: "gpt-5.6-sol",
+    defaultModel: "gpt-5.5",
+    scopedModel: "grok-4.6",
+  }), ["-m", "grok-4.6"]);
+});
+
+test("Feishu image content extracts image_key safely", () => {
+  assert.deepEqual(parseFeishuImageContent('{"image_key":"img_v3_abc"}'), {
+    imageKey: "img_v3_abc",
+  });
+  assert.deepEqual(parseFeishuImageContent('{"image_key":""}'), { imageKey: "" });
+  assert.deepEqual(parseFeishuImageContent("not-json"), { imageKey: "" });
+});
+
+test("Codex image arguments are only added for a downloaded image", () => {
+  assert.deepEqual(buildImageArgs("C:\\Temp\\feishu-image.jpg"), ["-i", "C:\\Temp\\feishu-image.jpg"]);
+  assert.deepEqual(buildImageArgs(""), []);
+});
+
+test("Codex sessions only resume when their stored model matches the requested model", () => {
+  assert.equal(typeof canResumeCodexSession, "function");
+  assert.equal(
+    canResumeCodexSession({
+      session: { threadId: "thread-grok", model: "grok-4.6" },
+      model: "gpt-5.6-sol",
+    }),
+    false
+  );
+  assert.equal(
+    canResumeCodexSession({
+      session: { threadId: "thread-legacy" },
+      model: "gpt-5.6-sol",
+    }),
+    false
+  );
+  assert.equal(
+    canResumeCodexSession({
+      session: { threadId: "thread-sol", model: "gpt-5.6-sol" },
+      model: "gpt-5.6-sol",
+    }),
+    true
+  );
+});
+
+test("bridge config includes Grok presets and grouped model card sections", () => {
+  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8");
+  assert.match(source, /buildModelChoiceGroups/);
+  assert.match(source, /Grok models/);
+  assert.match(source, /Codex\/provider models/);
+  assert.match(source, /modelGroups\.grok/);
+  assert.match(source, /modelGroups\.codex/);
+  assert.match(source, /buildModelArgs/);
+  assert.match(source, /messageResource\.get/);
+  assert.match(source, /buildImageArgs/);
+  assert.match(source, /imageKey/);
+  assert.match(source, /canResumeCodexSession/);
+  assert.match(source, /model: task\.model/);
+  assert.match(source, /model: this\.effectiveModel\(source\.chatId, projectPath\)/);
+  assert.doesNotMatch(source, /taskModel/);
+  assert.match(source, /controlCardMessageId/);
+  assert.match(source, /ignored action from stale control card/);
+});
+
+test("panel command always replies with a new card", () => {
+  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8");
+  const match = source.match(
+    /async function showControlCard\([\s\S]*?\n}\n\nif \(pairingCode\)/
+  );
+  assert.ok(match, "showControlCard implementation should be present");
+  assert.match(match[0], /messenger\.replyCard\(replyToMessageId, card\)/);
+  assert.doesNotMatch(match[0], /messenger\.updateCard\(/);
+});
+
 test("extractThreadCwds reads cwd values from thread/list result pages and ignores malformed threads", () => {
   assert.deepEqual(
     extractThreadCwds({
@@ -155,5 +257,73 @@ test("mergeProjectChoices preserves configured projects and appends discovered p
       { alias: "stock", path: "E:\\Stock_Analysis" },
       { alias: "jx3-wiki", path: "F:\\AIServer\\jx3-wiki" },
     ]
+  );
+});
+
+test("card project discovery only runs for explicit refresh actions", () => {
+  assert.equal(typeof shouldRefreshProjectChoicesForCardAction, "function");
+  assert.equal(shouldRefreshProjectChoicesForCardAction("refresh"), true);
+  assert.equal(shouldRefreshProjectChoicesForCardAction("show_sessions"), true);
+  assert.equal(shouldRefreshProjectChoicesForCardAction("set_project"), false);
+  assert.equal(shouldRefreshProjectChoicesForCardAction("set_model"), false);
+});
+
+test("same-card actions run serially so later model redraw cannot be overwritten", async () => {
+  assert.equal(typeof bridgeCore.createKeyedSerialExecutor, "function");
+  const execute = bridgeCore.createKeyedSerialExecutor();
+  const events = [];
+
+  const first = execute("om-card", async () => {
+    events.push("project:start");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    events.push("project:end");
+  });
+  const second = execute("om-card", async () => {
+    events.push("model:start");
+    events.push("model:end");
+  });
+
+  await Promise.all([first, second]);
+  assert.deepEqual(events, [
+    "project:start",
+    "project:end",
+    "model:start",
+    "model:end",
+  ]);
+});
+
+test("Feishu card patch responses with non-zero codes are rejected", () => {
+  assert.equal(typeof bridgeCore.assertFeishuApiSuccess, "function");
+  assert.doesNotThrow(() =>
+    bridgeCore.assertFeishuApiSuccess({ code: 0, msg: "success" }, "更新卡片")
+  );
+  assert.throws(
+    () => bridgeCore.assertFeishuApiSuccess({ code: 230020, msg: "message update failed" }, "更新卡片"),
+    /更新卡片失败.*230020.*message update failed/
+  );
+});
+
+test("actions from an older control card are treated as stale", () => {
+  assert.equal(typeof bridgeCore.isStaleControlCardAction, "function");
+  assert.equal(
+    bridgeCore.isStaleControlCardAction({
+      currentMessageId: "om-current",
+      actionMessageId: "om-old",
+    }),
+    true
+  );
+  assert.equal(
+    bridgeCore.isStaleControlCardAction({
+      currentMessageId: "om-current",
+      actionMessageId: "om-current",
+    }),
+    false
+  );
+  assert.equal(
+    bridgeCore.isStaleControlCardAction({
+      currentMessageId: "",
+      actionMessageId: "om-old",
+    }),
+    false
   );
 });
