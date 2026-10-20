@@ -150,7 +150,8 @@ function Ensure-BridgeConfig {
         "CODEX_FULL_AUTO=$(if ($envMap['CODEX_FULL_AUTO']) { $envMap['CODEX_FULL_AUTO'] } else { '0' })"
         "CODEX_CONFIG_OVERRIDES=$($envMap['CODEX_CONFIG_OVERRIDES'])"
         "CODEX_ENABLE_WEB_SEARCH=$(if ($envMap['CODEX_ENABLE_WEB_SEARCH']) { $envMap['CODEX_ENABLE_WEB_SEARCH'] } else { '0' })"
-        "STREAM_PUSH_INTERVAL=$(if ($envMap['STREAM_PUSH_INTERVAL']) { $envMap['STREAM_PUSH_INTERVAL'] } else { '5000' })"
+        "GENERATED_IMAGE_MAX_COUNT=$(if ($envMap['GENERATED_IMAGE_MAX_COUNT']) { $envMap['GENERATED_IMAGE_MAX_COUNT'] } else { '4' })"
+        "STREAM_PUSH_INTERVAL=$(if ($envMap['STREAM_PUSH_INTERVAL']) { $envMap['STREAM_PUSH_INTERVAL'] } else { '30000' })"
         "TASK_TIMEOUT=$(if ($envMap['TASK_TIMEOUT']) { $envMap['TASK_TIMEOUT'] } else { '1200000' })"
         "LOG_LEVEL=$(if ($envMap['LOG_LEVEL']) { $envMap['LOG_LEVEL'] } else { 'info' })"
     )

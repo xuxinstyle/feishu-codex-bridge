@@ -1,7 +1,16 @@
 import { Client, EventDispatcher, WSClient, normalizeCardAction } from "@larksuiteoapi/node-sdk";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -16,17 +25,21 @@ import {
   createMessageDeduper,
   effectiveCodexModel,
   effectiveReasoningEffort,
+  findFeishuApiErrorCode,
   mergeProjectChoices,
   parseCodexConfigDefaults,
   parseFeishuImageContent,
   parseCommand,
   parseProjectChoices,
+  selectGeneratedImagesForTask,
   shouldRefreshProjectChoicesForCardAction,
   isStaleControlCardAction,
+  updateOrRotateTextMessage,
   validateModelName,
   validateReasoningEffort,
 } from "./bridge-core.mjs";
 import { discoverCodexProjectPaths } from "./codex-projects.mjs";
+import { uploadAndSendFeishuImage } from "./feishu-media.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
 const HOME_CONFIG_PATH = path.join(HOME_CONFIG_DIR, "config.env");
@@ -239,7 +252,8 @@ const config = {
     projectDiscovery: optionalEnv("CODEX_PROJECT_DISCOVERY", "thread-list").trim().toLowerCase(),
     projectDiscoveryTimeout: optionalIntEnv("CODEX_PROJECT_DISCOVERY_TIMEOUT", 15_000),
     projectDiscoveryInterval: optionalIntEnv("CODEX_PROJECT_DISCOVERY_INTERVAL", 60_000),
-    streamPushInterval: optionalIntEnv("STREAM_PUSH_INTERVAL", 5000),
+    generatedImageMaxCount: optionalIntEnv("GENERATED_IMAGE_MAX_COUNT", 4),
+    streamPushInterval: optionalIntEnv("STREAM_PUSH_INTERVAL", 30_000),
     logLevel: optionalEnv("LOG_LEVEL", "info"),
     allowedUserIds: parseListEnv("ALLOWED_USER_IDS"),
   },
@@ -526,6 +540,10 @@ class FeishuMessenger {
       filePath,
       contentType: String(contentTypeHeader).split(";", 1)[0].trim().toLowerCase(),
     };
+  }
+
+  async sendImage(chatId, filePath) {
+    return uploadAndSendFeishuImage(this.client, chatId, filePath);
   }
 
   async updateText(messageId, text) {
@@ -861,6 +879,27 @@ class TaskRunner {
     if (messageId) this.persistSessionState();
   }
 
+  async publishTaskText(task, text, { rotateOnAnyUpdateError = false } = {}) {
+    const previousMessageId = task.statusMessageId;
+    const result = await updateOrRotateTextMessage({
+      messageId: previousMessageId,
+      text,
+      updateText: (messageId, nextText) => this.messenger.updateText(messageId, nextText),
+      createText: (nextText) => this.messenger.sendText(task.source.chatId, nextText),
+      rotateOnAnyUpdateError,
+    });
+    task.statusMessageId = result.messageId || null;
+    if (result.rotated && previousMessageId) {
+      log("info", "rotated task status message", {
+        taskId: task.taskId,
+        previousMessageId,
+        statusMessageId: task.statusMessageId,
+        updateErrorCode: findFeishuApiErrorCode(result.updateError),
+      });
+    }
+    return result;
+  }
+
   markKnownSession(chatId, projectPath, sessionName) {
     this.knownSessions.add(sessionKey(chatId, projectPath, sessionName));
   }
@@ -1162,6 +1201,7 @@ class TaskRunner {
       output: "",
       error: null,
       statusMessageId: null,
+      threadId: null,
       progress: "",
       lastEventAt: null,
       modelOverride: this.modelOverride(source.chatId, projectPath),
@@ -1190,6 +1230,7 @@ class TaskRunner {
     const existing = this.sessions.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
     const args = [];
     if (canResumeCodexSession({ session: existing, model: task.model })) {
+      task.threadId = existing.threadId;
       args.push("exec", "resume", "--json", "-o", lastMessageFile);
       this.appendCodexOptions(args, {
         isResume: true,
@@ -1249,34 +1290,35 @@ class TaskRunner {
     const lastMessageFile = path.join(tmpdir(), `feishu-codex-${task.taskId}.txt`);
     let imageDownloadPath = "";
     let pushTimer = null;
+    let pushInFlight = null;
     let lastPushed = "";
 
     try {
-      if (task.statusMessageId) {
-        await this.messenger.updateText(task.statusMessageId, `Codex 开始执行任务 ${task.taskId}...`);
-      } else {
-        task.statusMessageId = await this.messenger.replyText(
-          task.source.messageId,
-          `Codex 开始执行任务 ${task.taskId}...`
-        );
-      }
+      await this.publishTaskText(task, `Codex 开始执行任务 ${task.taskId}...`);
     } catch (error) {
       log("warn", "failed to send initial reply", { taskId: task.taskId, error: String(error) });
     }
 
     const push = async (force = false) => {
-      if (!task.statusMessageId) return;
+      if (pushInFlight) {
+        if (force) await pushInFlight;
+        else return;
+      }
       const now = Date.now();
       const elapsed = task.startedAt ? formatDuration(now - task.startedAt) : "0s";
       const lastEventAgo = task.lastEventAt ? formatDuration(now - task.lastEventAt) : "unknown";
       const body = truncateText(task.output || task.progress || "Codex 正在执行，暂时还没有可展示输出。");
       const text = `${body}\n\n状态: ${task.status}  task=${task.taskId}  elapsed=${elapsed}  last_event=${lastEventAgo} ago`;
       if (!force && text === lastPushed) return;
-      lastPushed = text;
+      const operation = this.publishTaskText(task, text);
+      pushInFlight = operation;
       try {
-        await this.messenger.updateText(task.statusMessageId, text);
+        await operation;
+        lastPushed = text;
       } catch (error) {
         log("warn", "failed to update status message", { taskId: task.taskId, error: String(error) });
+      } finally {
+        if (pushInFlight === operation) pushInFlight = null;
       }
     };
 
@@ -1359,6 +1401,7 @@ class TaskRunner {
           try {
             const event = JSON.parse(trimmed);
             if (event.thread_id && !threadId) threadId = event.thread_id;
+            if (event.thread_id) task.threadId = event.thread_id;
             const progress = describeCodexProgressEvent(event);
             if (progress && progress !== task.progress) {
               task.progress = progress;
@@ -1391,6 +1434,7 @@ class TaskRunner {
           try {
             const event = JSON.parse(stdoutBuffer.trim());
             if (event.thread_id && !threadId) threadId = event.thread_id;
+            if (event.thread_id) task.threadId = event.thread_id;
             const progress = describeCodexProgressEvent(event);
             if (progress && progress !== task.progress) {
               task.progress = progress;
@@ -1406,6 +1450,7 @@ class TaskRunner {
           if (finalMessage) task.output = finalMessage;
         }
         if (threadId) {
+          task.threadId = threadId;
           const key = sessionKey(task.source.chatId, task.projectPath, task.sessionName);
           const resetAt = this.sessionResetAt.get(key) || 0;
           if (task.createdAt >= resetAt) {
@@ -1441,17 +1486,51 @@ class TaskRunner {
     }
   } finally {
     if (pushTimer) clearInterval(pushTimer);
+    if (pushInFlight) {
+      try {
+        await pushInFlight;
+      } catch {
+        // The final delivery below has its own fallback.
+      }
+    }
     task.finishedAt = Date.now();
+    const generatedImages = this.generatedImagesForTask(task);
+    let sentImageCount = 0;
+    let imageDeliveryError = "";
+    for (const filePath of generatedImages) {
+      try {
+        const sent = await this.messenger.sendImage(task.source.chatId, filePath);
+        sentImageCount += 1;
+        log("info", "sent generated image to Feishu", {
+          taskId: task.taskId,
+          filePath,
+          imageKey: sent.imageKey,
+          messageId: sent.messageId,
+        });
+      } catch (error) {
+        imageDeliveryError = error instanceof Error ? error.message : String(error);
+        log("warn", "failed to send generated image", {
+          taskId: task.taskId,
+          filePath,
+          error: imageDeliveryError,
+        });
+      }
+    }
     const seconds = ((task.finishedAt - task.startedAt) / 1000).toFixed(1);
+    const imageDeliveryNote =
+      sentImageCount > 0
+        ? `\n图片: 已发送 ${sentImageCount} 张`
+        : imageDeliveryError
+          ? `\n图片发送失败: ${imageDeliveryError}`
+          : "";
     const finalText =
       task.status === "success"
-        ? `${truncateText(task.output || "Codex 已完成。")}\n\n完成: ${seconds}s  task=${task.taskId}`
+        ? `${truncateText(task.output || "Codex 已完成。")}\n\n完成: ${seconds}s  task=${task.taskId}${imageDeliveryNote}`
         : task.status === "cancelled"
           ? `已取消 task=${task.taskId}`
           : `执行失败 task=${task.taskId}\n\n${truncateText(task.output || task.error || "unknown error")}`;
     try {
-      if (task.statusMessageId) await this.messenger.updateText(task.statusMessageId, finalText);
-      else await this.messenger.sendText(task.source.chatId, finalText);
+      await this.publishTaskText(task, finalText, { rotateOnAnyUpdateError: true });
     } catch (error) {
       log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) });
     }
@@ -1460,6 +1539,38 @@ class TaskRunner {
     if (task.imagePath) rmSync(task.imagePath, { force: true });
     log("info", "task finished", { taskId: task.taskId, status: task.status, seconds });
   }
+  }
+
+  generatedImagesForTask(task) {
+    if (task.status !== "success" || !task.threadId || config.bridge.generatedImageMaxCount <= 0) {
+      return [];
+    }
+    const generatedRoot = path.resolve(codexHome, "generated_images");
+    const threadDirectory = path.resolve(generatedRoot, task.threadId);
+    if (
+      threadDirectory === generatedRoot ||
+      !threadDirectory.startsWith(`${generatedRoot}${path.sep}`) ||
+      !existsSync(threadDirectory)
+    ) {
+      return [];
+    }
+    const entries = [];
+    for (const item of readdirSync(threadDirectory, { withFileTypes: true })) {
+      if (!item.isFile()) continue;
+      const filePath = path.join(threadDirectory, item.name);
+      const stats = statSync(filePath);
+      entries.push({
+        filePath,
+        isFile: true,
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+      });
+    }
+    return selectGeneratedImagesForTask(entries, {
+      startedAt: task.startedAt,
+      finishedAt: task.finishedAt,
+      maxCount: config.bridge.generatedImageMaxCount,
+    });
   }
 
   killActive(taskId = null) {

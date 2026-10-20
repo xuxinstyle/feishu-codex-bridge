@@ -12,6 +12,7 @@
    - `im:message:send_as_bot`
    - `im:message:send`
    - `im:chat`
+   - `im:resource`（获取与上传图片或文件资源，用于发送 Codex 生成的图片）
    - `im:message.p2p_msg:readonly`
    - `im:message.group_at_msg:readonly`
 5. **版本管理与发布** -> 创建版本并发布；改权限后必须重新发布

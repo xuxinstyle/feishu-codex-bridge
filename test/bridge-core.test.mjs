@@ -13,6 +13,8 @@ import {
   effectiveCodexModel,
   effectiveReasoningEffort,
   extractThreadCwds,
+  findFeishuApiErrorCode,
+  isFeishuMessageEditLimitError,
   mergeProjectChoices,
   parseFeishuImageContent,
   parseCodexConfigDefaults,
@@ -21,6 +23,8 @@ import {
   validateReasoningEffort,
   validateModelName,
   shouldRefreshProjectChoicesForCardAction,
+  selectGeneratedImagesForTask,
+  updateOrRotateTextMessage,
 } from "../bridge-core.mjs";
 
 test("parseCommand recognizes model show, set, and default commands", () => {
@@ -332,6 +336,95 @@ test("Feishu card patch responses with non-zero codes are rejected", () => {
   assert.throws(
     () => bridgeCore.assertFeishuApiSuccess({ code: 230020, msg: "message update failed" }, "更新卡片"),
     /更新卡片失败.*230020.*message update failed/
+  );
+});
+
+test("Feishu edit-limit errors are found in SDK and nested error shapes", () => {
+  const sdkError = {
+    response: {
+      data: {
+        code: 230072,
+        msg: "The message has reached the number of times it can be edited.",
+      },
+    },
+  };
+  assert.equal(findFeishuApiErrorCode(sdkError), 230072);
+  assert.equal(isFeishuMessageEditLimitError([[new Error("request failed"), sdkError]]), true);
+  assert.equal(isFeishuMessageEditLimitError({ response: { data: { code: 230020 } } }), false);
+});
+
+test("task status updates keep the same message until Feishu requires rotation", async () => {
+  const updates = [];
+  const creates = [];
+  const unchanged = await updateOrRotateTextMessage({
+    messageId: "om-current",
+    text: "running",
+    updateText: async (messageId, text) => updates.push([messageId, text]),
+    createText: async (text) => {
+      creates.push(text);
+      return "om-new";
+    },
+  });
+  assert.deepEqual(unchanged, {
+    messageId: "om-current",
+    rotated: false,
+    updateError: null,
+  });
+  assert.deepEqual(updates, [["om-current", "running"]]);
+  assert.deepEqual(creates, []);
+
+  const limited = { response: { data: { code: 230072 } } };
+  const rotated = await updateOrRotateTextMessage({
+    messageId: "om-current",
+    text: "still running",
+    updateText: async () => {
+      throw limited;
+    },
+    createText: async (text) => {
+      creates.push(text);
+      return "om-new";
+    },
+  });
+  assert.equal(rotated.messageId, "om-new");
+  assert.equal(rotated.rotated, true);
+  assert.equal(rotated.updateError, limited);
+  assert.deepEqual(creates, ["still running"]);
+});
+
+test("final task delivery rotates after any update failure", async () => {
+  const result = await updateOrRotateTextMessage({
+    messageId: "om-current",
+    text: "done",
+    updateText: async () => {
+      throw new Error("temporary update failure");
+    },
+    createText: async () => "om-final",
+    rotateOnAnyUpdateError: true,
+  });
+  assert.equal(result.messageId, "om-final");
+  assert.equal(result.rotated, true);
+});
+
+test("generated image selection keeps only recent supported files within Feishu limits", () => {
+  const startedAt = 10_000;
+  assert.deepEqual(
+    selectGeneratedImagesForTask(
+      [
+        { filePath: "old.png", size: 100, mtimeMs: 1000 },
+        { filePath: "first.png", size: 100, mtimeMs: 10_100 },
+        { filePath: "not-image.txt", size: 100, mtimeMs: 10_200 },
+        { filePath: "too-large.webp", size: 11 * 1024 * 1024, mtimeMs: 10_300 },
+        { filePath: "second.JPG", size: 200, mtimeMs: 10_400 },
+        { filePath: "third.gif", size: 300, mtimeMs: 10_500 },
+      ],
+      {
+        startedAt,
+        finishedAt: 11_000,
+        maxCount: 2,
+        clockSkewMs: 0,
+      }
+    ),
+    ["first.png", "second.JPG"]
   );
 });
 

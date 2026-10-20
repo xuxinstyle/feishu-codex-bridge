@@ -356,6 +356,114 @@ export function assertFeishuApiSuccess(response, operation = "飞书 API") {
   throw new Error(`${operation}失败: code=${code ?? "unknown"} msg=${message}`);
 }
 
+export function findFeishuApiErrorCode(error) {
+  const queue = [error];
+  const seen = new Set();
+  let inspected = 0;
+
+  while (queue.length > 0 && inspected < 100) {
+    const value = queue.shift();
+    inspected += 1;
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string") {
+      const match = value.match(/\bcode[=:]\s*(\d+)\b/i);
+      if (match) return Number(match[1]);
+      continue;
+    }
+    if (typeof value !== "object" || seen.has(value)) continue;
+    seen.add(value);
+
+    const code = Number(value.code);
+    if (Number.isInteger(code) && code > 0) return code;
+    if (Array.isArray(value)) {
+      queue.push(...value);
+      continue;
+    }
+    for (const nested of Object.values(value)) queue.push(nested);
+  }
+
+  return null;
+}
+
+export function isFeishuMessageEditLimitError(error) {
+  return findFeishuApiErrorCode(error) === 230072;
+}
+
+export async function updateOrRotateTextMessage({
+  messageId = "",
+  text,
+  updateText,
+  createText,
+  rotateOnAnyUpdateError = false,
+}) {
+  if (!messageId) {
+    return {
+      messageId: await createText(text),
+      rotated: true,
+      updateError: null,
+    };
+  }
+
+  try {
+    await updateText(messageId, text);
+    return { messageId, rotated: false, updateError: null };
+  } catch (error) {
+    if (!rotateOnAnyUpdateError && !isFeishuMessageEditLimitError(error)) throw error;
+    return {
+      messageId: await createText(text),
+      rotated: true,
+      updateError: error,
+    };
+  }
+}
+
+const FEISHU_IMAGE_EXTENSIONS = new Set([
+  ".bmp",
+  ".gif",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".png",
+  ".tif",
+  ".tiff",
+  ".webp",
+]);
+
+export function selectGeneratedImagesForTask(
+  entries,
+  {
+    startedAt,
+    finishedAt = Date.now(),
+    maxCount = 4,
+    maxBytes = 10 * 1024 * 1024,
+    clockSkewMs = 2000,
+  } = {}
+) {
+  const start = Number(startedAt) - clockSkewMs;
+  const end = Number(finishedAt) + clockSkewMs;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || maxCount <= 0) return [];
+
+  return (Array.isArray(entries) ? entries : [])
+    .filter((entry) => {
+      const extension = path.extname(String(entry?.filePath || "")).toLowerCase();
+      const size = Number(entry?.size);
+      const mtimeMs = Number(entry?.mtimeMs);
+      return (
+        entry?.isFile !== false &&
+        FEISHU_IMAGE_EXTENSIONS.has(extension) &&
+        Number.isFinite(size) &&
+        size > 0 &&
+        size <= maxBytes &&
+        Number.isFinite(mtimeMs) &&
+        mtimeMs >= start &&
+        mtimeMs <= end
+      );
+    })
+    .sort((left, right) => left.mtimeMs - right.mtimeMs || left.filePath.localeCompare(right.filePath))
+    .slice(0, maxCount)
+    .map((entry) => entry.filePath);
+}
+
 export function isStaleControlCardAction({ currentMessageId = "", actionMessageId = "" } = {}) {
   return Boolean(currentMessageId && actionMessageId && currentMessageId !== actionMessageId);
 }

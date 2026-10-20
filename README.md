@@ -155,6 +155,8 @@ Session 示例：
 | `CODEX_DANGEROUS_BYPASS` | `0` | 显式设 `1` 才完全绕过审批和 sandbox |
 | `CODEX_CONFIG_OVERRIDES` | 空 | 分号分隔多个 `-c key=value` |
 | `SESSION_STATE_PATH` | `~/.feishu-codex-bridge/state.json` | session/threadId/active session 持久化文件 |
+| `GENERATED_IMAGE_MAX_COUNT` | `4` | 单个任务最多发送到飞书的本轮生成图片数量；设为 `0` 可关闭图片输出 |
+| `STREAM_PUSH_INTERVAL` | `30000` | 任务状态 heartbeat 更新间隔，单位毫秒 |
 
 项目候选的来源为：
 
@@ -168,9 +170,10 @@ Session 示例：
 
 - 飞书权限变更后必须发布新版本，否则可能能收消息但不能回复。
 - 图片输入需要飞书应用开启机器人能力，并拥有读取消息资源的权限；bridge 会通过消息资源接口下载图片后交给 Codex CLI。
+- 图片生成任务完成后，bridge 会从当前 Codex thread 的 `generated_images` 目录中识别本轮新图片，上传并发送到当前飞书聊天；需要应用身份权限 `im:resource`（获取与上传图片或文件资源），且单张图片必须符合飞书 10 MB 限制。
 - 群聊 @ 需要 `im.message.receive_v1` 事件订阅和 `im:message.group_at_msg:readonly` 权限；如果 bridge 终端完全没有收到日志，就是开放平台配置/发布问题。
 - 飞书互动卡片按钮需要开放平台事件 `card.action.trigger` 可用；如果卡片能发出但按钮无反应，检查事件订阅 / 权限发布状态。
-- 任务状态消息会按 `STREAM_PUSH_INTERVAL` 推送 heartbeat：`elapsed` 表示任务运行时长，`last_event` 表示距上次收到 Codex stdout/stderr 事件的时间；长任务中 `last_event` 变大通常表示 Codex 正在长思考、压缩上下文或执行无输出命令，不等于 bridge 已挂。
+- 任务状态消息会按 `STREAM_PUSH_INTERVAL` 推送 heartbeat：`elapsed` 表示任务运行时长，`last_event` 表示距上次收到 Codex stdout/stderr 事件的时间；长任务中 `last_event` 变大通常表示 Codex 正在长思考、压缩上下文或执行无输出命令，不等于 bridge 已挂。飞书返回消息编辑次数上限时，bridge 会自动新发一条状态消息继续更新；最终结果更新失败时也会新发消息兜底。
 - 同一 session 内连续发送多个任务会排队执行；不同 session 可以并发执行。需要中止时可在卡片中点击对应 session 的取消按钮，或显式发送 `/cancel task-xxxx`。
 - 不同 session 并发使用同一个工作区，适合相互独立的任务；如果同时修改同一批文件，仍可能产生工作区冲突。
 - 同一飞书聊天窗口可以维护多个命名 session；普通消息使用当前 active session，`/use <名字>` 可切换，`/new <名字>` 可新开或重置一条线。session 历史会持久化到 `SESSION_STATE_PATH`，重启 bridge 后仍可在 `/panel` 看到。
