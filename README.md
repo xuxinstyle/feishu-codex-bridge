@@ -154,7 +154,7 @@ Session 示例：
 | `CODEX_TASK_TRANSPORT` | `desktop` | 通过客户端自身提交消息并同步侧栏；需保持 Codex 客户端打开。`app-server` 可独立运行，但不保证客户端侧栏即时同步，并可能遇到会话写入占用 |
 | `CODEX_HOME` | `~/.codex` | 与 Codex 客户端使用相同的数据目录，才能共享聊天历史 |
 | `CODEX_MODEL` | 空 | 留空则走 `~/.codex/config.toml` |
-| `CODEX_MODEL_CHOICES` | `grok-4.6,grok-4.5,gpt-5.5,gpt-5.4` | 卡片模型候选，逗号分隔；可追加当前 Codex provider/catalog 支持的任意模型 ID |
+| `CODEX_MODEL_CHOICES` | 空（自动读取 Codex 模型目录） | 逗号分隔的额外模型候选；用于追加当前 Codex provider 支持的模型 ID |
 | `CODEX_REASONING_EFFORT` | 空 | 默认推理强度覆盖；留空则走 `~/.codex/config.toml` |
 | `CODEX_REASONING_EFFORT_CHOICES` | `low,medium,high,xhigh,max,ultra` | 卡片推理强度候选 |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | 新 session 的 sandbox |
@@ -200,7 +200,9 @@ Session 示例：
 - `/project <别名或路径>` 会改变该飞书聊天窗口后续普通消息的执行项目；`/run <路径> ...` 仍可临时指定项目路径。
 - 模型和推理强度覆盖按“当前飞书聊天窗口 + 当前项目”保存；切换项目后会看到该项目自己的模型 / 推理强度状态。
 - `/panel` → 设置显示实际生效的模型与推理强度：优先当前聊天窗口 + 项目覆盖，其次 `CODEX_MODEL` / `CODEX_REASONING_EFFORT`，最后读取 `CODEX_HOME`（默认 `~/.codex`）下的 `config.toml`。
-- 模型设置页保留 Codex/provider 与 Grok 候选，面板选择和 `/model <模型名>` 都传给同一执行通道。
+- 模型设置页通过本机 Codex 引擎的 `config/read` 和 `model/list` 同步实际生效配置与完整模型目录（包含自定义 `model_catalog_json`、profile 和配置覆盖），打开模型页时自动刷新，支持分页；刷新失败保留上次列表。`CODEX_MODEL_CHOICES` 可追加候选，面板选择和 `/model <模型名>` 都传给同一执行通道。
+- 真实模型切换验证：保持 Codex 客户端打开后运行 `node scripts/verify-model-switch.mjs`；验证完整目录、模型按钮、设置持久化、命令切换和 `gpt-5.6-sol` 的真实推理及历史模型元数据，结果保存至 `outputs/model-switch-verification.json`。测试使用独立状态和本地信使，不向飞书聊天发送测试消息。
+- 桌面通道收到服务端明确的 `model_change_requires_reconnect` 拒绝时，确认该轮没有模型输出、工具执行或新轮次后，在同一会话重试一次；普通失败、停止和继续任务不会触发此重试。
 - `/model <模型名>` 可切换任意当前本机 Codex provider/catalog 支持的模型；如果模型不在面板候选中，直接发送命令即可。Grok 的实际可用性取决于本机 `~/.codex/config.toml` 的 provider、catalog 和鉴权配置，桥接本身不会新增或保存 Grok 凭据。
 - 卡片切换项目不会同步扫描 Codex 历史线程；项目发现只在启动、卡片“刷新列表”、查看项目以及后台定时刷新时执行，避免阻塞卡片动作导致飞书重复投递或使用旧卡片状态。
 - 同一卡片的后台任务操作按消息 ID 串行执行，刷新和导航独立处理；页面版本校验会丢弃已过时的后台刷新结果。重复投递同一事件不会重复新建会话；飞书返回非零错误码时 bridge 会记录更新失败并给出重试提示。

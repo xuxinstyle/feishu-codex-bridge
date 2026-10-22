@@ -741,6 +741,24 @@ test("a refresh PATCH already in flight is repaired to the latest callback navig
   assert.deepEqual(applied.at(-1), sessions);
 });
 
+test("model discovery acknowledges immediately and cannot overwrite later navigation", async t => {
+  let releaseModels;
+  const modelGate = new Promise(resolve => { releaseModels = resolve; });
+  const f = fixture();
+  t.after(async () => { releaseModels(); await f.flushActions(); });
+  f.context.config.codex.modelCatalog = { get: () => ({ models: ["gpt-5.6-sol"] }), refresh: () => modelGate };
+  await f.message("/panel");
+  await f.click("show_settings");
+  const result = await f.click("show_models");
+  assert.equal(result?.toast?.type, "info");
+  const home = await f.dispatch({ bridge: "feishu-codex-bridge", scopeChatId: "chat", projectPath: "repo", action: "show_home" });
+  assert.equal(home?.card?.type, "raw");
+  const before = f.updates.length;
+  releaseModels();
+  await f.flushActions();
+  assert.equal(f.updates.length, before);
+});
+
 test("a pending refresh on the same card does not delay stopping the running task", async t => {
   let finishRefresh;
   const refreshGate = new Promise(resolve => { finishRefresh = resolve; });
