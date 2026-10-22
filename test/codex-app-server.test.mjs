@@ -123,6 +123,37 @@ test("cancel interrupts the engine before closing transport", async () => {
   assert.ok(f.child.killed);
 });
 
+test("steering appends requirements to the same turn without interrupting or starting a second turn", async () => {
+  let control, delivered;
+  const f = setup({ onTurn: () => { setImmediate(() => { delivered = control.steer("请先测试"); }); }, onRequest: (r, p) => {
+    if (r.method !== "turn/steer") return false;
+    assert.equal(r.params.expectedTurnId, "turn-a");
+    assert.equal(r.params.threadId, "thread-a");
+    assert.equal(r.params.input[0].text, "请先测试");
+    assert.equal(r.params.model, undefined);
+    p.reply(r, { turnId: "turn-a" });
+    complete(p, "已结合补充要求完成");
+    return true;
+  } });
+  const result = await runAppServerTask({ ...f.options, onControl: c => { control = c; } });
+  assert.equal((await delivered).turnId, result.turn.id);
+  assert.equal(f.requests.filter(r => r.method === "turn/start").length, 1);
+  assert.ok(!f.requests.some(r => r.method === "turn/interrupt"));
+});
+
+test("a steering rejection leaves the original turn running", async () => {
+  let control, rejected;
+  const f = setup({ onTurn: () => { setImmediate(() => { rejected = assert.rejects(control.steer("补充"), error => error.steerOutcomeUnknown === false); }); }, onRequest: (r, p) => {
+    if (r.method !== "turn/steer") return false;
+    p.send({ id: r.id, error: { code: -32602, message: "turn mismatch" } });
+    complete(p);
+    return true;
+  } });
+  await runAppServerTask({ ...f.options, onControl: c => { control = c; } });
+  await rejected;
+  assert.ok(!f.requests.some(r => r.method === "turn/interrupt"));
+});
+
 test("timeout during initialize stops the process with a useful timeout error", async () => {
   const f = setup({ onRequest: r => r.method === "initialize" });
   await assert.rejects(runAppServerTask({ ...f.options, timeoutMs: 20 }), /timeout after/);

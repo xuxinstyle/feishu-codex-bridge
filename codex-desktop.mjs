@@ -66,6 +66,25 @@ export async function callDesktopTool(pipePath, callerThreadId, tool, args, time
   try { return JSON.parse(text); } catch { throw new Error(`Codex Desktop ${tool} returned invalid JSON: ${text.slice(0, 300)}`); }
 }
 
+export async function steerDesktopTask({ pipePath, threadId, turnId, prompt, callTool = callDesktopTool }) {
+  if (!prompt?.trim()) throw new Error("补充要求不能为空。");
+  const history = await callTool(pipePath, threadId, "read_thread", { threadId, hostId: "local", turnLimit: 1 });
+  const active = history.turns?.[0];
+  if (!turnId || active?.id !== turnId || active.status !== "inProgress") {
+    throw new Error("原任务轮次已结束或已切换，无法引导；消息仍留在队列。");
+  }
+  // Desktop's sendFollowUpMessage routes active work through its turn coordinator
+  // (steer/user-message admission). Never open a second app-server history writer.
+  // Omit model/thinking: steering inherits the running turn's settings.
+  try {
+    await callTool(pipePath, threadId, "send_message_to_thread", { threadId, hostId: "local", prompt });
+    return { turnId };
+  } catch (error) {
+    error.steerOutcomeUnknown = true;
+    throw error;
+  }
+}
+
 export async function prepareDesktopThread({ command, argsPrefix, configArgs, cwd, env, shell, threadId, model, sandbox, approvalPolicy, name }) {
   const rpc = new CodexAppServer({ command, argsPrefix, configArgs, cwd, env, shell });
   try {
@@ -100,6 +119,7 @@ export async function runDesktopTask({
   pipePath = findDesktopPipe(), prepare = prepareDesktopThread, callTool = callDesktopTool, ...options
 }) {
   if (!pipePath) throw new Error("未检测到 Codex 客户端，请先打开客户端，再从飞书发送消息。");
+  let finished = false;
   onControl({ canCancel: false });
   try {
     const threadId = await prepare({ ...options, cwd, threadId: existingId, model });
@@ -121,6 +141,11 @@ export async function runDesktopTask({
       ...(model ? { model } : {}), ...(effort ? { thinking: effort } : {}) });
     if (projectId) await call("move_thread_to_project", { threadId, hostId: "local", projectId });
     onProgress("Codex 客户端已开始处理任务。");
+    let activeTurnId;
+    onControl({ canCancel: false, steer: prompt => {
+      if (finished) throw new Error("当前轮次已结束，无法引导。");
+      return steerDesktopTask({ pipePath, threadId, turnId: activeTurnId, prompt, callTool });
+    } });
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       // wait_threads cannot wait on its own calling thread. The Desktop read
@@ -131,6 +156,8 @@ export async function runDesktopTask({
         await new Promise(resolve => setTimeout(resolve, 1500));
         continue;
       }
+      activeTurnId ||= turn.id;
+      if (turn.id !== activeTurnId) throw new Error("Codex 客户端已切换轮次，请在客户端查看原任务结果。");
       const messages = turn.items?.filter(i => i.type === "agentMessage") || [];
       const final = messages.filter(i => i.phase === "final_answer");
       const output = (final.length ? final : messages).map(i => i.text).join("\n\n");
@@ -144,5 +171,5 @@ export async function runDesktopTask({
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
     throw new Error("等待 Codex 回复超时；任务可能仍在客户端执行，请在客户端查看或停止。");
-  } finally { onControl(null); }
+  } finally { finished = true; onControl(null); }
 }

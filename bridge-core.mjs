@@ -64,6 +64,13 @@ export function parseCommand(text) {
   const cancelMatch = trimmed.match(/^\/cancel\s+(task-\S+)$/);
   if (cancelMatch) return { type: "cancel", taskId: cancelMatch[1] };
 
+  const steerMatch = trimmed.match(/^\/(?:steer|引导)(?:\s+([\s\S]+))?$/i);
+  if (steerMatch) {
+    const prompt = (steerMatch[1] || "").trim();
+    return /^task-\S+$/.test(prompt) ? { type: "steer", taskId: prompt }
+      : { type: "steer", prompt };
+  }
+
   const runWithPath = trimmed.match(/^\/run\s+((?:~|\.{1,2}|[A-Za-z]:)?[\\/][^\s]+)\s+(.+)$/s);
   if (runWithPath) {
     return { type: "run", projectPath: runWithPath[1], prompt: runWithPath[2].trim() };

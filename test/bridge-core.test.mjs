@@ -27,6 +27,13 @@ import {
   updateOrRotateTextMessage,
 } from "../bridge-core.mjs";
 
+test("steering commands preserve multiline requirements and support queued message ids", () => {
+  assert.deepEqual(parseCommand("/steer 先修复测试\n再更新文档"), { type: "steer", prompt: "先修复测试\n再更新文档" });
+  assert.deepEqual(parseCommand("/引导 task-abc"), { type: "steer", taskId: "task-abc" });
+  assert.deepEqual(parseCommand("/steer"), { type: "steer", prompt: "" });
+  assert.deepEqual(parseCommand("引导用户完成登录"), { type: "run", prompt: "引导用户完成登录" });
+});
+
 test("parseCommand recognizes model show, set, and default commands", () => {
   assert.deepEqual(parseCommand("/model"), { type: "model", action: "show" });
   assert.deepEqual(parseCommand("/model gpt-5.5"), {

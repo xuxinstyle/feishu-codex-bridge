@@ -2,7 +2,38 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { callDesktopTool, findDesktopPipe, runDesktopTask } from "../codex-desktop.mjs";
+import { callDesktopTool, findDesktopPipe, runDesktopTask, steerDesktopTask } from "../codex-desktop.mjs";
+
+test("Desktop steering uses the existing writer and inherits the active turn settings", async () => {
+  const calls = [];
+  const result = await steerDesktopTask({ pipePath: "pipe", threadId: "thread-a", turnId: "turn-a", prompt: "请先测试",
+    callTool: async (_pipe, caller, tool, args) => {
+      calls.push({ caller, tool, args });
+      if (tool === "read_thread") return { turns: [{ id: "turn-a", status: "inProgress" }] };
+      return {};
+    },
+  });
+  assert.equal(result.turnId, "turn-a");
+  assert.deepEqual(calls.map(c => c.tool), ["read_thread", "send_message_to_thread"]);
+  assert.deepEqual(calls[1].args, { threadId: "thread-a", hostId: "local", prompt: "请先测试" });
+});
+
+test("Desktop steering refuses a completed or replacement turn before dispatch", async () => {
+  for (const turn of [{ id: "turn-a", status: "completed" }, { id: "turn-b", status: "inProgress" }]) {
+    await assert.rejects(steerDesktopTask({ pipePath: "pipe", threadId: "thread-a", turnId: "turn-a", prompt: "补充",
+      callTool: async (_p, _t, tool) => { assert.equal(tool, "read_thread"); return { turns: [turn] }; },
+    }), /已结束或已切换/);
+  }
+});
+
+test("Desktop delivery errors are ambiguous and must not trigger automatic retries", async () => {
+  await assert.rejects(steerDesktopTask({ pipePath: "pipe", threadId: "thread-a", turnId: "turn-a", prompt: "补充",
+    callTool: async (_p, _t, tool) => {
+      if (tool === "read_thread") return { turns: [{ id: "turn-a", status: "inProgress" }] };
+      throw new Error("pipe closed");
+    },
+  }), error => error.steerOutcomeUnknown === true);
+});
 
 function fixture({ baselineStatus = "idle", finalStatus = "completed", prepareError } = {}) {
   const calls = [];
@@ -53,6 +84,31 @@ test("an active Desktop turn is never interrupted by a new Feishu message", asyn
   const f = fixture({ baselineStatus: "active" });
   await assert.rejects(runDesktopTask(f.options), /正在 Codex 客户端执行/);
   assert.ok(!f.calls.some(c => c.tool === "send_message_to_thread"));
+});
+
+test("a running Desktop task exposes steering and continues observing the same turn", async () => {
+  const f = fixture();
+  const original = f.options.callTool;
+  let reads = 0, control, submission, dispatched = false;
+  const callTool = async (pipe, caller, tool, args) => {
+    if (tool === "read_thread") {
+      reads++;
+      if (reads > 1) return { turns: [{ id: "new-turn", status: dispatched ? "completed" : "inProgress",
+        items: [{ type: "agentMessage", phase: "final_answer", text: dispatched ? "包含引导的结果" : "处理中" }],
+      }] };
+    }
+    if (tool === "send_message_to_thread" && args.prompt === "补充要求") dispatched = true;
+    return original(pipe, caller, tool, args);
+  };
+  const result = await runDesktopTask({ ...f.options, callTool, onControl: c => { control = c; }, onProgress: text => {
+    if (text === "Codex 客户端正在执行任务。") submission = control.steer("补充要求");
+  } });
+  assert.equal((await submission).turnId, result.turn.id);
+  assert.equal(result.output, "包含引导的结果");
+  assert.equal(control, null);
+  const sent = f.calls.filter(c => c.tool === "send_message_to_thread");
+  assert.equal(sent.length, 2);
+  assert.ok(!f.calls.some(c => /interrupt|stop/.test(c.tool)));
 });
 
 test("Desktop failures reach Feishu instead of returning the previous completed reply", async () => {

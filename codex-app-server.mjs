@@ -102,7 +102,7 @@ export class CodexAppServer extends EventEmitter {
       if (!pending) return;
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(`${pending.method}: ${message.error.message || "request failed"}`));
+      if (message.error) pending.reject(Object.assign(new Error(`${pending.method}: ${message.error.message || "request failed"}`), { rpcCode: message.error.code }));
       else pending.resolve(message.result);
     } else if (message.method) {
       this.emit("notification", message.method, message.params || {});
@@ -194,7 +194,22 @@ export async function runAppServerTask({
       rpc.close();
     }
   };
-  const control = { cancel: () => stop(new Error("Codex task cancelled")) };
+  const control = {
+    cancel: () => stop(new Error("Codex task cancelled")),
+    steer: async (prompt) => {
+      if (settled || stopping || !threadId || !turnId) throw new Error("当前轮次尚未开始或已结束，无法引导。");
+      if (!prompt?.trim()) throw new Error("补充要求不能为空。");
+      try {
+        return await rpc.request("turn/steer", {
+          threadId, expectedTurnId: turnId,
+          input: [{ type: "text", text: prompt, text_elements: [] }],
+        });
+      } catch (error) {
+        error.steerOutcomeUnknown = error.rpcCode === undefined;
+        throw error;
+      }
+    },
+  };
   rpc.on("diagnostic", onDiagnostic);
   rpc.on("disconnect", (error) => finish(error));
   rpc.on("interactiveRequest", (method) => stop(new Error(`飞书暂不支持交互请求 ${method}，请在 Codex 客户端处理后重试。`)));

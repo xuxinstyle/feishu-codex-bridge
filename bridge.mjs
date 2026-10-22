@@ -36,6 +36,7 @@ import {
 import { discoverCodexProjectPaths } from "./codex-projects.mjs";
 import { APP_SERVER_SESSION_BACKEND, canResumeAppServerSession, desktopCodexBinary, runAppServerTask } from "./codex-app-server.mjs";
 import { runDesktopTask } from "./codex-desktop.mjs";
+import { TaskSteering, buildSteeringCard } from "./task-steering.mjs";
 import { uploadAndSendFeishuImage } from "./feishu-media.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
@@ -463,6 +464,7 @@ function getHelpMessage() {
     "- /run <路径> <描述>：指定仓库或目录执行",
     "- 直接发送图片：下载图片后交给 Codex 通过 -i 参数分析",
     "- 连续发送多个任务会排队执行，不会自动取消前一个任务",
+    "- 排队文字消息可点击「引导」提交给当前任务，不中断运行；也可发送 /steer 补充要求",
     "- /sessions：查看当前仓库的 Codex session",
     "- /use <名字>：切换当前聊天窗口的 active session",
     "- /new <名字>：新建/重置命名 session 并切换过去",
@@ -815,8 +817,12 @@ class TaskRunner {
       initialEntries: state.handledMessageIds,
     });
     this.sessionResetAt = new Map();
+    this.sessionGenerations = new Map();
     this.activeTasks = new Map();
     this.sessionQueues = new Map();
+    this.steering = new TaskSteering({ tasks: this.tasks, controls: this.activeTasks,
+      isCurrent: task => task.sessionGeneration === (this.sessionGenerations.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName)) || 0),
+    });
   }
 
   persistSessionState() {
@@ -1058,6 +1064,7 @@ class TaskRunner {
     const normalized = this.setActiveSession(chatId, projectPath, sessionName);
     const key = sessionKey(chatId, projectPath, normalized);
     this.sessionResetAt.set(key, Date.now());
+    this.sessionGenerations.set(key, (this.sessionGenerations.get(key) || 0) + 1);
     const existed = this.sessions.delete(key);
     this.persistSessionState();
     return { sessionName: normalized, existed };
@@ -1065,7 +1072,7 @@ class TaskRunner {
 
   cancelTask(taskId) {
     const task = this.tasks.get(taskId);
-    if (!task || ["success", "failed", "cancelled"].includes(task.status)) return false;
+    if (!task || task.steeringDone || ["success", "failed", "cancelled", "steered"].includes(task.status)) return false;
     if (this.activeTasks.get(taskId)?.canCancel === false) return false;
     task.status = "cancelled";
     if (this.activeTasks.has(taskId)) this.killActive(taskId);
@@ -1073,6 +1080,7 @@ class TaskRunner {
   }
 
   cancelFailureMessage(taskId) {
+    if (this.tasks.get(taskId)?.steeringDone) return "这条消息正在提交引导，请等待提交结果。";
     return this.activeTasks.get(taskId)?.canCancel === false
       ? "这个任务正在 Codex 客户端执行，请在对应聊天中点击停止。"
       : `无法取消 task=${taskId || "unknown"}，任务可能已完成或不存在`;
@@ -1160,6 +1168,7 @@ class TaskRunner {
   async create(source, projectPath, prompt, sessionName, imageKey = "") {
     const normalizedSessionName = normalizeSessionName(sessionName);
     const ahead = this.pendingCountForSession(source.chatId, projectPath, normalizedSessionName);
+    const steerTarget = this.steering.active(source.chatId, projectPath, normalizedSessionName);
     const task = {
       taskId: generateTaskId(),
       source,
@@ -1180,6 +1189,8 @@ class TaskRunner {
       modelOverride: this.modelOverride(source.chatId, projectPath),
       reasoningOverride: this.reasoningOverride(source.chatId, projectPath),
       model: this.effectiveModel(source.chatId, projectPath),
+      steerTargetTaskId: steerTarget?.taskId,
+      sessionGeneration: this.sessionGenerations.get(sessionKey(source.chatId, projectPath, normalizedSessionName)) || 0,
     };
     this.tasks.set(task.taskId, task);
     try {
@@ -1190,6 +1201,10 @@ class TaskRunner {
       task.statusMessageId = await this.messenger.replyText(task.source.messageId, queueText);
     } catch (error) {
       log("warn", "failed to send queue reply", { taskId: task.taskId, error: String(error) });
+    }
+    if (steerTarget && !imageKey) {
+      try { task.steerCardMessageId = await this.messenger.replyCard(source.messageId, buildSteeringCard(task)); }
+      catch (error) { log("warn", "failed to send steering card", { taskId: task.taskId, error: String(error) }); }
     }
     const key = sessionKey(task.source.chatId, task.projectPath, task.sessionName);
     const queue = this.sessionQueues.get(key) || Promise.resolve();
@@ -1214,7 +1229,7 @@ class TaskRunner {
 
   saveAppServerSession(task, threadId, { completed = false } = {}) {
     const key = sessionKey(task.source.chatId, task.projectPath, task.sessionName);
-    if (task.createdAt < (this.sessionResetAt.get(key) || 0)) return;
+    if (!this.steering.isCurrent(task)) return;
     const existing = this.sessions.get(key);
     this.markKnownSession(task.source.chatId, task.projectPath, task.sessionName);
     this.sessions.set(key, {
@@ -1231,8 +1246,7 @@ class TaskRunner {
   }
 
   async run(task) {
-    if (task.status === "cancelled") return;
-    task.status = "running";
+    if (!await this.steering.claimForRun(task)) return;
     task.startedAt = Date.now();
     task.lastEventAt = task.startedAt;
     let imageDownloadPath = "";
@@ -1672,6 +1686,27 @@ async function handleMessage(message) {
     await messenger.replyText(message.messageId, ok ? "已取消。" : runner.cancelFailureMessage(command.taskId));
     return;
   }
+  if (command.type === "steer") {
+    let notice;
+    try {
+      const result = command.taskId
+        ? await runner.steering.promote(command.taskId, { chatId: message.chatId, senderId: message.senderId })
+        : await runner.steering.submit(runner.steering.active(message.chatId, activeProjectPath,
+          runner.activeSessionName(message.chatId, activeProjectPath)), command.prompt);
+      notice = `已提交引导，task=${result.targetTaskId}；当前任务继续运行。`;
+      if (command.taskId) {
+        try { await runner.publishTaskText(runner.tasks.get(command.taskId), notice); }
+        catch (error) { log("warn", "failed to update steering receipt", { error: String(error) }); }
+      }
+    } catch (error) {
+      notice = error.steerOutcomeUnknown
+        ? (command.taskId ? "引导回执未确认，请到 Codex 客户端核对；为避免重复执行，这条排队消息已暂停。"
+          : "引导回执未确认，请到 Codex 客户端核对；未自动重发，请核对后再决定是否补发。")
+        : `引导未提交：${error.message}`;
+    }
+    await messenger.replyText(message.messageId, notice);
+    return;
+  }
   if (command.type !== "run") {
     await messenger.replyText(message.messageId, "无法识别指令，发送 /help 查看用法。");
     return;
@@ -1738,6 +1773,28 @@ async function handleNormalizedCardAction(event) {
       : config.bridge.defaultProjectPath;
   if (!actionChatId) {
     log("warn", "card action missing chat scope", { action: value.action, event });
+    return;
+  }
+  // Queue cards have their own identity and remain usable after /panel refresh.
+  if (value.action === "steer_task") {
+    if (!event.messageId || (event.chatId && event.chatId !== actionChatId)) return;
+    const task = runner.tasks.get(value.taskId);
+    let notice;
+    try {
+      const result = await runner.steering.promote(value.taskId, {
+        chatId: actionChatId, senderId: event.operator.openId, messageId: event.messageId,
+      });
+      notice = `已提交引导，task=${result.targetTaskId}；当前任务继续运行。`;
+      try { await runner.publishTaskText(task, notice); }
+      catch (error) { log("warn", "failed to update steering receipt", { error: String(error) }); }
+    } catch (error) {
+      notice = error.steerOutcomeUnknown
+        ? "引导回执未确认，请到 Codex 客户端核对；为避免重复执行，这条排队消息已暂停。"
+        : `引导未提交：${error.message}`;
+    }
+    if (task?.steerCardMessageId === event.messageId && task.source.chatId === actionChatId && task.source.senderId === event.operator.openId) {
+      await messenger.updateCard(event.messageId, buildSteeringCard(task, notice));
+    }
     return;
   }
   const currentCardMessageId = runner.controlCardMessageId(actionChatId);
