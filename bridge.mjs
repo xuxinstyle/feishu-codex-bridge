@@ -1,5 +1,4 @@
 import { Client, EventDispatcher, WSClient, normalizeCardAction } from "@larksuiteoapi/node-sdk";
-import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
@@ -15,11 +14,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
   assertFeishuApiSuccess,
-  buildImageArgs,
-  buildModelArgs,
   buildModelChoiceGroups,
-  canResumeCodexSession,
-  codexConfigOverrideForReasoning,
   cardProjectPathForAction,
   createKeyedSerialExecutor,
   createMessageDeduper,
@@ -39,6 +34,8 @@ import {
   validateReasoningEffort,
 } from "./bridge-core.mjs";
 import { discoverCodexProjectPaths } from "./codex-projects.mjs";
+import { APP_SERVER_SESSION_BACKEND, canResumeAppServerSession, desktopCodexBinary, runAppServerTask } from "./codex-app-server.mjs";
+import { runDesktopTask } from "./codex-desktop.mjs";
 import { uploadAndSendFeishuImage } from "./feishu-media.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
@@ -232,6 +229,7 @@ const config = {
     appSecret: requiredEnv("FEISHU_APP_SECRET"),
   },
   codex: {
+    transport: optionalEnv("CODEX_TASK_TRANSPORT", "desktop"),
     bin: optionalEnv("CODEX_BIN", "codex"),
     model: optionalEnv("CODEX_MODEL"),
     defaultModel: codexDefaults.model,
@@ -281,7 +279,10 @@ config.bridge.projectChoices = buildProjectChoices(
   optionalEnv("CODEX_PROJECTS")
 );
 config.bridge.manualProjectChoices = config.bridge.projectChoices;
-const codexLauncher = resolveCodexLauncher(config.codex.bin);
+const codexLauncher = resolveCodexLauncher(desktopCodexBinary(config.codex.bin));
+if (!["desktop", "app-server"].includes(config.codex.transport)) {
+  throw new Error("CODEX_TASK_TRANSPORT must be desktop or app-server");
+}
 
 if (!existsSync(config.bridge.defaultProjectPath)) {
   throw new Error(`DEFAULT_PROJECT_PATH does not exist: ${config.bridge.defaultProjectPath}`);
@@ -325,6 +326,7 @@ async function refreshProjectChoices(reason = "manual") {
   if (projectRefreshPromise) return projectRefreshPromise;
 
   projectRefreshPromise = (async () => {
+    const startedAt = Date.now();
     try {
       const discoveredPaths = normalizeDiscoveredProjectPaths(
         await discoverCodexProjectPaths({
@@ -342,12 +344,14 @@ async function refreshProjectChoices(reason = "manual") {
         reason,
         discoveredCount: discoveredPaths.length,
         totalCount: config.bridge.projectChoices.length,
+        durationMs: Date.now() - startedAt,
       });
     } catch (error) {
-      config.bridge.projectChoices = config.bridge.manualProjectChoices;
       log("warn", "failed to refresh project choices from Codex thread history", {
         reason,
         error: String(error),
+        retainedCount: config.bridge.projectChoices.length,
+        durationMs: Date.now() - startedAt,
       });
     } finally {
       projectRefreshPromise = null;
@@ -795,44 +799,6 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "sess
   };
 }
 
-function extractCodexTextEvent(event) {
-  if (!event || typeof event !== "object") return "";
-  if (event.type === "item.completed" && event.item?.type === "agent_message") {
-    return typeof event.item.text === "string" ? event.item.text : "";
-  }
-  if (event.type === "item.completed" && event.item?.type === "assistant_message") {
-    return typeof event.item.text === "string" ? event.item.text : "";
-  }
-  if (event.type === "agent_message" && typeof event.message === "string") return event.message;
-  if (event.type === "assistant_message" && typeof event.message === "string") return event.message;
-  if (event.type === "error" && typeof event.message === "string") return `ERROR: ${event.message}\n`;
-  if (event.type === "turn.failed" && event.error?.message) return `FAILED: ${event.error.message}\n`;
-  if (event.type === "exec_command.begin" && event.command) return `RUN: ${event.command}\n`;
-  if (event.type === "exec_command.end" && event.exit_code !== undefined) {
-    return `EXIT ${event.exit_code}: ${event.command || ""}\n`;
-  }
-  return "";
-}
-
-function appendTaskOutput(task, text) {
-  const block = String(text || "").trim();
-  if (!block) return;
-  task.output = task.output ? `${task.output.trimEnd()}\n\n${block}\n` : `${block}\n`;
-}
-
-function describeCodexProgressEvent(event) {
-  if (!event || typeof event !== "object") return "";
-  if (event.type === "thread.started") return `Codex session 已启动: ${event.thread_id || "unknown"}`;
-  if (event.type === "turn.started") return "Codex 已开始处理任务。";
-  if (event.type === "turn.completed") return "Codex 已完成本轮处理。";
-  if (event.type === "turn.failed") return "Codex 本轮处理失败。";
-  if (event.type === "item.completed" && event.item?.type) {
-    return `Codex 事件: item.completed/${event.item.type}`;
-  }
-  if (event.type) return `Codex 事件: ${event.type}`;
-  return "";
-}
-
 class TaskRunner {
   constructor(messenger) {
     this.messenger = messenger;
@@ -1100,9 +1066,16 @@ class TaskRunner {
   cancelTask(taskId) {
     const task = this.tasks.get(taskId);
     if (!task || ["success", "failed", "cancelled"].includes(task.status)) return false;
+    if (this.activeTasks.get(taskId)?.canCancel === false) return false;
     task.status = "cancelled";
     if (this.activeTasks.has(taskId)) this.killActive(taskId);
     return true;
+  }
+
+  cancelFailureMessage(taskId) {
+    return this.activeTasks.get(taskId)?.canCancel === false
+      ? "这个任务正在 Codex 客户端执行，请在对应聊天中点击停止。"
+      : `无法取消 task=${taskId || "unknown"}，任务可能已完成或不存在`;
   }
 
   pendingCount(chatId = null) {
@@ -1226,60 +1199,35 @@ class TaskRunner {
     return task;
   }
 
-  buildArgs(task, lastMessageFile) {
-    const existing = this.sessions.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
-    const args = [];
-    if (canResumeCodexSession({ session: existing, model: task.model })) {
-      task.threadId = existing.threadId;
-      args.push("exec", "resume", "--json", "-o", lastMessageFile);
-      this.appendCodexOptions(args, {
-        isResume: true,
-        modelOverride: task.modelOverride,
-        reasoningOverride: task.reasoningOverride,
-      });
-      args.push(...buildImageArgs(task.imagePath));
-      args.push(existing.threadId, "-");
-      return args;
-    }
-    args.push("exec", "--json", "-o", lastMessageFile, "-C", task.projectPath);
-    this.appendCodexOptions(args, {
-      isResume: false,
-      modelOverride: task.modelOverride,
-      reasoningOverride: task.reasoningOverride,
-    });
-    args.push(...buildImageArgs(task.imagePath));
-    args.push("-");
-    return args;
-  }
-
-  appendCodexOptions(args, { isResume, modelOverride = "", reasoningOverride = "" }) {
-    args.push(...buildModelArgs({
-      configuredModel: config.codex.model,
-      defaultModel: config.codex.defaultModel,
-      scopedModel: modelOverride,
-    }));
-    const reasoningEffort = effectiveReasoningEffort({
+  appServerConfigArgs(task) {
+    const overrides = [...config.codex.configOverrides];
+    if (config.codex.profile) overrides.push(`profile=${JSON.stringify(config.codex.profile)}`);
+    if (config.codex.enableWebSearch) overrides.push('web_search="live"');
+    const effort = effectiveReasoningEffort({
       configuredEffort: config.codex.reasoningEffort,
       defaultEffort: config.codex.defaultReasoningEffort,
-      scopedEffort: reasoningOverride,
+      scopedEffort: task.reasoningOverride,
     });
-    if (config.codex.profile) args.push("-p", config.codex.profile);
-    for (const override of config.codex.configOverrides) {
-      args.push("-c", override);
-    }
-    const reasoningOverrideArg = codexConfigOverrideForReasoning(reasoningEffort);
-    if (reasoningOverrideArg) args.push("-c", reasoningOverrideArg);
-    if (config.codex.approvalPolicy) {
-      args.push("-c", `approval_policy="${config.codex.approvalPolicy}"`);
-    }
-    if (config.codex.enableWebSearch && !isResume) args.push("--search");
-    if (config.codex.dangerousBypass) {
-      args.push("--dangerously-bypass-approvals-and-sandbox");
-    } else if (config.codex.fullAuto) {
-      args.push("--full-auto");
-    } else if (!isResume && config.codex.sandboxMode) {
-      args.push("--sandbox", config.codex.sandboxMode);
-    }
+    if (effort) overrides.push(`model_reasoning_effort=${JSON.stringify(effort)}`);
+    return overrides.flatMap((value) => ["-c", value]);
+  }
+
+  saveAppServerSession(task, threadId, { completed = false } = {}) {
+    const key = sessionKey(task.source.chatId, task.projectPath, task.sessionName);
+    if (task.createdAt < (this.sessionResetAt.get(key) || 0)) return;
+    const existing = this.sessions.get(key);
+    this.markKnownSession(task.source.chatId, task.projectPath, task.sessionName);
+    this.sessions.set(key, {
+      name: task.sessionName,
+      threadId,
+      backend: APP_SERVER_SESSION_BACKEND,
+      transport: config.codex.transport,
+      model: task.model,
+      projectPath: task.projectPath,
+      turns: (existing?.threadId === threadId ? existing.turns || 0 : 0) + (completed ? 1 : 0),
+      updatedAt: new Date().toISOString(),
+    });
+    this.persistSessionState();
   }
 
   async run(task) {
@@ -1287,7 +1235,6 @@ class TaskRunner {
     task.status = "running";
     task.startedAt = Date.now();
     task.lastEventAt = task.startedAt;
-    const lastMessageFile = path.join(tmpdir(), `feishu-codex-${task.taskId}.txt`);
     let imageDownloadPath = "";
     let pushTimer = null;
     let pushInFlight = null;
@@ -1351,194 +1298,117 @@ class TaskRunner {
         });
       }
 
-      const args = this.buildArgs(task, lastMessageFile);
-      const spawnArgs = [...codexLauncher.argsPrefix, ...args];
-      log("info", "starting codex", {
-        taskId: task.taskId,
-        cwd: task.projectPath,
+      if (task.status === "cancelled") return;
+      const existing = this.sessions.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
+      const threadId = canResumeAppServerSession(existing, task.model) ? existing.threadId : null;
+      const name = `[飞书] ${path.basename(task.projectPath)} · ${task.sessionName}`;
+      log("info", "starting Codex task", {
+        taskId: task.taskId, cwd: task.projectPath, command: codexLauncher.command, threadId, transport: config.codex.transport,
+      });
+      const executeTask = config.codex.transport === "desktop" ? runDesktopTask : runAppServerTask;
+      const result = await executeTask({
         command: codexLauncher.command,
-        args: spawnArgs,
+        argsPrefix: codexLauncher.argsPrefix,
+        shell: codexLauncher.shell,
+        configArgs: this.appServerConfigArgs(task),
+        cwd: task.projectPath,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        threadId,
+        model: task.model,
+        effort: effectiveReasoningEffort({
+          configuredEffort: config.codex.reasoningEffort,
+          defaultEffort: config.codex.defaultReasoningEffort,
+          scopedEffort: task.reasoningOverride,
+        }),
+        sandbox: config.codex.dangerousBypass ? "danger-full-access"
+          : config.codex.fullAuto ? "workspace-write" : config.codex.sandboxMode,
+        approvalPolicy: config.codex.dangerousBypass ? "never" : config.codex.approvalPolicy,
+        prompt: task.prompt,
+        imagePath: task.imagePath,
+        name,
+        timeoutMs: config.codex.taskTimeout,
+        onControl: (control) => {
+          if (control) this.activeTasks.set(task.taskId, control);
+          else this.activeTasks.delete(task.taskId);
+        },
+        onThread: (id) => {
+          task.threadId = id;
+          task.desktopName = name;
+          this.saveAppServerSession(task, id);
+        },
+        onOutput: (output) => { task.output = output; task.lastEventAt = Date.now(); },
+        onProgress: (progress) => { task.progress = progress; task.lastEventAt = Date.now(); },
+        onDiagnostic: (text) => {
+          task.lastEventAt = Date.now();
+          log("debug", "codex app-server diagnostic", { taskId: task.taskId, text: text.trim() });
+        },
       });
+      task.output = result.output || task.output;
+      this.saveAppServerSession(task, result.threadId, { completed: true });
 
-      await new Promise((resolve, reject) => {
-        const child = spawn(codexLauncher.command, spawnArgs, {
-          cwd: task.projectPath,
-          env: { ...process.env },
-          shell: codexLauncher.shell,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-        this.activeTasks.set(task.taskId, child);
-        child.stdin?.on("error", (error) => {
-          log("debug", "codex stdin error", { taskId: task.taskId, error: String(error) });
-        });
-        child.stdin?.end(task.prompt, "utf8");
-
-      let stdoutBuffer = "";
-      let stderrTail = "";
-      let threadId = null;
-      let settled = false;
-
-      const settle = (fn) => {
-        if (settled) return;
-        settled = true;
-        fn();
-      };
-
-      const timeout = setTimeout(() => {
-        task.status = "timeout";
-        this.killActive(task.taskId);
-        settle(() => reject(new Error(`Codex task timeout after ${config.codex.taskTimeout / 1000}s`)));
-      }, config.codex.taskTimeout);
-
-      child.stdout?.on("data", (chunk) => {
-        task.lastEventAt = Date.now();
-        stdoutBuffer += chunk.toString("utf8");
-        const lines = stdoutBuffer.split(/\r?\n/);
-        stdoutBuffer = lines.pop() || "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try {
-            const event = JSON.parse(trimmed);
-            if (event.thread_id && !threadId) threadId = event.thread_id;
-            if (event.thread_id) task.threadId = event.thread_id;
-            const progress = describeCodexProgressEvent(event);
-            if (progress && progress !== task.progress) {
-              task.progress = progress;
-              log("info", "codex progress", { taskId: task.taskId, progress });
-            }
-            appendTaskOutput(task, extractCodexTextEvent(event));
-          } catch {
-            appendTaskOutput(task, trimmed);
-          }
-        }
-      });
-
-      child.stderr?.on("data", (chunk) => {
-        task.lastEventAt = Date.now();
-        const text = chunk.toString("utf8");
-        stderrTail = `${stderrTail}${text}`.slice(-4000);
-        log("debug", "codex stderr", { taskId: task.taskId, text: text.trim() });
-      });
-
-      child.on("error", (error) => {
-        clearTimeout(timeout);
-        this.activeTasks.delete(task.taskId);
-        settle(() => reject(error));
-      });
-
-      child.on("close", (exitCode) => {
-        clearTimeout(timeout);
-        this.activeTasks.delete(task.taskId);
-        if (stdoutBuffer.trim()) {
-          try {
-            const event = JSON.parse(stdoutBuffer.trim());
-            if (event.thread_id && !threadId) threadId = event.thread_id;
-            if (event.thread_id) task.threadId = event.thread_id;
-            const progress = describeCodexProgressEvent(event);
-            if (progress && progress !== task.progress) {
-              task.progress = progress;
-              log("info", "codex progress", { taskId: task.taskId, progress });
-            }
-            appendTaskOutput(task, extractCodexTextEvent(event));
-          } catch {
-            appendTaskOutput(task, stdoutBuffer.trim());
-          }
-        }
-        if (existsSync(lastMessageFile)) {
-          const finalMessage = readFileSync(lastMessageFile, "utf8").trim();
-          if (finalMessage) task.output = finalMessage;
-        }
-        if (threadId) {
-          task.threadId = threadId;
-          const key = sessionKey(task.source.chatId, task.projectPath, task.sessionName);
-          const resetAt = this.sessionResetAt.get(key) || 0;
-          if (task.createdAt >= resetAt) {
-            const existing = this.sessions.get(key);
-            this.markKnownSession(task.source.chatId, task.projectPath, task.sessionName);
-            this.sessions.set(key, {
-              name: task.sessionName,
-              threadId,
-              model: task.model,
-              projectPath: task.projectPath,
-              turns: (existing?.turns || 0) + 1,
-              updatedAt: new Date().toISOString(),
-            });
-            this.persistSessionState();
-          }
-        }
-        if (exitCode === 0 || task.status === "cancelled") {
-          settle(resolve);
-        } else {
-          const detail = task.output || stderrTail || `Codex exit code ${exitCode}`;
-          settle(() => reject(new Error(detail.slice(-2000))));
-        }
-      });
-    });
-
-    if (task.status === "cancelled") return;
-    task.status = "success";
-  } catch (error) {
-    if (task.status !== "cancelled") {
-      task.status = "failed";
-      task.error = error instanceof Error ? error.message : String(error);
-      if (!task.output) task.output = task.error;
-    }
-  } finally {
-    if (pushTimer) clearInterval(pushTimer);
-    if (pushInFlight) {
-      try {
-        await pushInFlight;
-      } catch {
-        // The final delivery below has its own fallback.
-      }
-    }
-    task.finishedAt = Date.now();
-    const generatedImages = this.generatedImagesForTask(task);
-    let sentImageCount = 0;
-    let imageDeliveryError = "";
-    for (const filePath of generatedImages) {
-      try {
-        const sent = await this.messenger.sendImage(task.source.chatId, filePath);
-        sentImageCount += 1;
-        log("info", "sent generated image to Feishu", {
-          taskId: task.taskId,
-          filePath,
-          imageKey: sent.imageKey,
-          messageId: sent.messageId,
-        });
-      } catch (error) {
-        imageDeliveryError = error instanceof Error ? error.message : String(error);
-        log("warn", "failed to send generated image", {
-          taskId: task.taskId,
-          filePath,
-          error: imageDeliveryError,
-        });
-      }
-    }
-    const seconds = ((task.finishedAt - task.startedAt) / 1000).toFixed(1);
-    const imageDeliveryNote =
-      sentImageCount > 0
-        ? `\n图片: 已发送 ${sentImageCount} 张`
-        : imageDeliveryError
-          ? `\n图片发送失败: ${imageDeliveryError}`
-          : "";
-    const finalText =
-      task.status === "success"
-        ? `${truncateText(task.output || "Codex 已完成。")}\n\n完成: ${seconds}s  task=${task.taskId}${imageDeliveryNote}`
-        : task.status === "cancelled"
-          ? `已取消 task=${task.taskId}`
-          : `执行失败 task=${task.taskId}\n\n${truncateText(task.output || task.error || "unknown error")}`;
-    try {
-      await this.publishTaskText(task, finalText, { rotateOnAnyUpdateError: true });
+      if (task.status === "cancelled") return;
+      task.status = "success";
     } catch (error) {
-      log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) });
+      if (task.status !== "cancelled") {
+        task.status = "failed";
+        task.error = error instanceof Error ? error.message : String(error);
+        if (!task.output) task.output = task.error;
+      }
+    } finally {
+      if (pushTimer) clearInterval(pushTimer);
+      if (pushInFlight) {
+        try {
+          await pushInFlight;
+        } catch {
+          // The final delivery below has its own fallback.
+        }
+      }
+      task.finishedAt = Date.now();
+      const generatedImages = this.generatedImagesForTask(task);
+      let sentImageCount = 0;
+      let imageDeliveryError = "";
+      for (const filePath of generatedImages) {
+        try {
+          const sent = await this.messenger.sendImage(task.source.chatId, filePath);
+          sentImageCount += 1;
+          log("info", "sent generated image to Feishu", {
+            taskId: task.taskId,
+            filePath,
+            imageKey: sent.imageKey,
+            messageId: sent.messageId,
+          });
+        } catch (error) {
+          imageDeliveryError = error instanceof Error ? error.message : String(error);
+          log("warn", "failed to send generated image", {
+            taskId: task.taskId,
+            filePath,
+            error: imageDeliveryError,
+          });
+        }
+      }
+      const seconds = ((task.finishedAt - task.startedAt) / 1000).toFixed(1);
+      const imageDeliveryNote =
+        sentImageCount > 0
+          ? `\n图片: 已发送 ${sentImageCount} 张`
+          : imageDeliveryError
+            ? `\n图片发送失败: ${imageDeliveryError}`
+            : "";
+      const finalText =
+        task.status === "success"
+          ? `${truncateText(task.output || "Codex 已完成。")}\n\n完成: ${seconds}s  task=${task.taskId}${imageDeliveryNote}`
+          : task.status === "cancelled"
+            ? `已取消 task=${task.taskId}`
+            : `执行失败 task=${task.taskId}\n\n${truncateText([task.output, task.error !== task.output ? task.error : ""].filter(Boolean).join("\n\n") || "unknown error")}`;
+      try {
+        const desktopNote = task.desktopName ? `\nCodex 客户端会话：${task.desktopName}` : "";
+        await this.publishTaskText(task, `${finalText}${desktopNote}`, { rotateOnAnyUpdateError: true });
+      } catch (error) {
+        log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) });
+      }
+      if (imageDownloadPath) rmSync(imageDownloadPath, { force: true });
+      if (task.imagePath) rmSync(task.imagePath, { force: true });
+      log("info", "task finished", { taskId: task.taskId, status: task.status, seconds });
     }
-    rmSync(lastMessageFile, { force: true });
-    if (imageDownloadPath) rmSync(imageDownloadPath, { force: true });
-    if (task.imagePath) rmSync(task.imagePath, { force: true });
-    log("info", "task finished", { taskId: task.taskId, status: task.status, seconds });
-  }
   }
 
   generatedImagesForTask(task) {
@@ -1580,8 +1450,17 @@ class TaskRunner {
     }
     const child = this.activeTasks.get(taskId);
     if (!child) return;
+    if (child.canCancel === false) {
+      this.activeTasks.delete(taskId);
+      return;
+    }
     log("info", "killing active codex process", { taskId });
     try {
+      if (child.cancel) {
+        child.cancel();
+        this.activeTasks.delete(taskId);
+        return;
+      }
       child.kill("SIGINT");
       setTimeout(() => {
         if (!child.killed) child.kill("SIGTERM");
@@ -1790,7 +1669,7 @@ async function handleMessage(message) {
   }
   if (command.type === "cancel") {
     const ok = runner.cancelTask(command.taskId);
-    await messenger.replyText(message.messageId, ok ? "已取消。" : "无法取消，任务可能已完成或不存在。");
+    await messenger.replyText(message.messageId, ok ? "已取消。" : runner.cancelFailureMessage(command.taskId));
     return;
   }
   if (command.type !== "run") {
@@ -1941,7 +1820,7 @@ async function handleNormalizedCardAction(event) {
   } else if (value.action === "cancel_task") {
     const taskId = typeof value.taskId === "string" ? value.taskId : "";
     const ok = taskId ? runner.cancelTask(taskId) : false;
-    notice = ok ? `已取消 task=${taskId}` : `无法取消 task=${taskId || "unknown"}，任务可能已完成或不存在`;
+    notice = ok ? `已取消 task=${taskId}` : runner.cancelFailureMessage(taskId);
   } else {
     notice = `未知动作: ${value.action}`;
   }
@@ -2003,6 +1882,9 @@ log("info", "starting Feishu Codex bridge", {
   sessionStatePath: config.bridge.sessionStatePath,
   defaultProjectPath: config.bridge.defaultProjectPath,
   codexBin: config.codex.bin,
+  codexCommand: codexLauncher.command,
+  sessionBackend: APP_SERVER_SESSION_BACKEND,
+  taskTransport: config.codex.transport,
 });
 await wsClient.start({ eventDispatcher: dispatcher });
 log("info", "Feishu WebSocket connected; waiting for messages");

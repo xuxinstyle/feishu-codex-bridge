@@ -91,11 +91,12 @@ test("discoverCodexProjectPaths initializes and paginates both archived thread l
       method: request.method,
       archived: request.params.archived,
       cursor: request.params.cursor,
+      useStateDbOnly: request.params.useStateDbOnly,
       })),
     [
-      { method: "thread/list", archived: false, cursor: null },
-      { method: "thread/list", archived: false, cursor: "active-page-2" },
-      { method: "thread/list", archived: true, cursor: null },
+      { method: "thread/list", archived: false, cursor: null, useStateDbOnly: true },
+      { method: "thread/list", archived: false, cursor: "active-page-2", useStateDbOnly: true },
+      { method: "thread/list", archived: true, cursor: null, useStateDbOnly: true },
     ]
   );
   assert.equal(child.killed, true);
@@ -134,7 +135,48 @@ test("discoverCodexProjectPaths rejects when App Server does not respond before 
 
   await assert.rejects(
     discoverCodexProjectPaths({ timeoutMs: 20, spawnImpl }),
-    /timed out/
+    /timed out.*waiting for initialize; 0 pages read/
   );
   assert.equal(child.killed, true);
+});
+
+test("project discovery preserves Chinese paths split across stdout byte chunks", async () => {
+  const paths = await discoverCodexProjectPaths({ timeoutMs: 1000, spawnImpl: () => new FakeChild((request, child) => {
+    if (request.method === "initialize") child.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\n");
+    if (request.method !== "thread/list") return;
+    const frame = Buffer.from(JSON.stringify({ id: request.id, result: { data: [{ cwd: "D:\\中文项目" }], nextCursor: null } }) + "\n");
+    const split = frame.indexOf(Buffer.from("中文")) + 1;
+    child.stdout.write(frame.subarray(0, split));
+    child.stdout.write(frame.subarray(split));
+  }) });
+  assert.deepEqual(paths, ["D:\\中文项目"]);
+});
+
+test("stdin failures reject discovery promptly and shut down the child", async () => {
+  let child;
+  const promise = discoverCodexProjectPaths({ timeoutMs: 1000, spawnImpl: () => {
+    child = new FakeChild(() => {});
+    return child;
+  } });
+  child.stdin.emit("error", new Error("stdin closed"));
+  await assert.rejects(promise, /stdin closed/);
+  assert.ok(child.killed);
+  // No unhandled stream error after the process was already shut down.
+  child.stdin.emit("error", new Error("late EPIPE"));
+});
+
+test("stalled pagination reports the current method and completed page count", async () => {
+  let calls = 0;
+  const promise = discoverCodexProjectPaths({ timeoutMs: 20, spawnImpl: () => new FakeChild((request, child) => {
+    if (request.method === "initialize") child.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\n");
+    if (request.method === "thread/list" && calls++ === 0) child.stdout.write(JSON.stringify({ id: request.id, result: { data: [], nextCursor: "next" } }) + "\n");
+  }) });
+  await assert.rejects(promise, /waiting for thread\/list; 1 pages read/);
+});
+
+test("repeated pagination cursors stop discovery instead of looping until timeout", async () => {
+  await assert.rejects(discoverCodexProjectPaths({ timeoutMs: 1000, spawnImpl: () => new FakeChild((request, child) => {
+    if (request.method === "initialize") child.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\n");
+    if (request.method === "thread/list") child.stdout.write(JSON.stringify({ id: request.id, result: { data: [], nextCursor: "repeated" } }) + "\n");
+  }) }), /repeated thread\/list cursor/);
 });

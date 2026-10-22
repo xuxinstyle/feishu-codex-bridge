@@ -197,17 +197,17 @@ test("Codex sessions only resume when their stored model matches the requested m
 });
 
 test("bridge config includes Grok presets and grouped model card sections", () => {
-  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.match(source, /buildModelChoiceGroups/);
   assert.match(source, /Grok models/);
   assert.match(source, /Codex\/provider models/);
   assert.match(source, /modelGroups\.grok/);
   assert.match(source, /modelGroups\.codex/);
-  assert.match(source, /buildModelArgs/);
+  assert.match(source, /runAppServerTask/);
   assert.match(source, /messageResource\.get/);
-  assert.match(source, /buildImageArgs/);
+  assert.match(source, /imagePath: task\.imagePath/);
   assert.match(source, /imageKey/);
-  assert.match(source, /canResumeCodexSession/);
+  assert.match(source, /canResumeAppServerSession/);
   assert.match(source, /model: task\.model/);
   assert.match(source, /model: this\.effectiveModel\(source\.chatId, projectPath\)/);
   assert.doesNotMatch(source, /taskModel/);
@@ -216,7 +216,7 @@ test("bridge config includes Grok presets and grouped model card sections", () =
 });
 
 test("panel command always replies with a new card", () => {
-  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   const match = source.match(
     /async function showControlCard\([\s\S]*?\n}\n\nif \(pairingCode\)/
   );
@@ -226,7 +226,7 @@ test("panel command always replies with a new card", () => {
 });
 
 test("panel command replies before refreshing project history", () => {
-  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   const match = source.match(
     /if \(command\.type === "panel"\) \{[\s\S]*?\n  \}\n  if \(command\.type === "project"\)/
   );

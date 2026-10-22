@@ -1,4 +1,5 @@
 import { spawn as defaultSpawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { extractThreadCwds } from "./bridge-core.mjs";
 
 const DEFAULT_PAGE_SIZE = 100;
@@ -37,8 +38,11 @@ export async function discoverCodexProjectPaths({
   let inputBuffer = "";
   let settled = false;
   let timer = null;
+  let currentMethod = "initialize";
+  let pagesRead = 0;
   const pending = new Map();
   const discoveredPaths = [];
+  const decoder = new StringDecoder("utf8");
 
   const cleanup = () => {
     if (timer) clearTimeout(timer);
@@ -76,7 +80,7 @@ export async function discoverCodexProjectPaths({
   };
 
   const onStdout = (chunk) => {
-    inputBuffer += String(chunk);
+    inputBuffer += decoder.write(chunk);
     const lines = inputBuffer.split(/\r?\n/);
     inputBuffer = lines.pop() || "";
     for (const line of lines) {
@@ -97,6 +101,7 @@ export async function discoverCodexProjectPaths({
   };
 
   const request = (method, params) => {
+    currentMethod = method;
     const id = nextRequestId++;
     const message = `${JSON.stringify({ id, method, params })}\n`;
     return new Promise((resolve, reject) => {
@@ -114,8 +119,11 @@ export async function discoverCodexProjectPaths({
   child.stderr?.on("data", onStderr);
   child.on("error", onChildError);
   child.on("close", onChildClose);
+  // Keep this listener through shutdown to absorb a late EPIPE when the timeout
+  // closes the process before its stdin has finished flushing.
+  child.stdin?.on("error", onChildError);
   timer = setTimeout(() => {
-    const error = new Error(`Codex App Server discovery timed out after ${timeoutMs}ms`);
+    const error = new Error(`Codex App Server discovery timed out after ${timeoutMs}ms (waiting for ${currentMethod}; ${pagesRead} pages read)`);
     finish(() => failPending(error));
   }, timeoutMs);
 
@@ -137,7 +145,12 @@ export async function discoverCodexProjectPaths({
           archived,
           cursor,
           limit: pageSize,
+          // Periodic project discovery needs the indexed cwd values only. The
+          // default list path scans/repairs rollout logs on every page, which can
+          // exceed the entire discovery timeout on machines with many sessions.
+          useStateDbOnly: true,
         });
+        pagesRead += 1;
         discoveredPaths.push(...extractThreadCwds(response));
         const nextCursor = response?.result?.nextCursor ?? null;
         if (!nextCursor) break;
