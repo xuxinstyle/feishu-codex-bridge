@@ -6,6 +6,7 @@ import { CodexAppServer, matchingProjectId, resolveAppServerProjectId } from "./
 import { interruptDesktopTurn, startDesktopTurn, steerDesktopTurn } from "./codex-desktop-ipc.mjs";
 import { TurnInterrupt } from "./turn-interrupt.mjs";
 import { missingSteeringInputs } from "./steering-context.mjs";
+import { historyProjectPath } from "./codex-history.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
@@ -116,7 +117,7 @@ export async function prepareDesktopThread({ command, argsPrefix, configArgs, cw
 }
 
 export async function runDesktopTask({
-  prompt, imagePath, model, effort, cwd, threadId: existingId, expectedTurnId, continuationInputs = [], expectedInitialInputKind, timeoutMs = 1_200_000,
+  prompt, imagePath, model, effort, cwd, threadId: existingId, preserveThreadPlacement = false, expectedTurnId, continuationInputs = [], expectedInitialInputKind, timeoutMs = 1_200_000,
   onThread = () => {}, onTurnStarted = () => {}, onControl = () => {}, onOutput = () => {}, onProgress = () => {},
   onSubmission = () => {},
   interruptTurn = interruptDesktopTurn,
@@ -125,6 +126,7 @@ export async function runDesktopTask({
   pipePath = findDesktopPipe(), prepare = prepareDesktopThread, callTool = callDesktopTool, ...options
 }) {
   const resumeConflict = () => new Error("会话已有新内容或原轮次未停止，请从当前会话继续。");
+  if (preserveThreadPlacement && !existingId) throw new Error("附加已有会话必须提供 threadId，不能新建会话。");
   if (expectedTurnId && !existingId) throw resumeConflict();
   if (continuationInputs.length && !expectedTurnId) throw resumeConflict();
   if (!pipePath) throw new Error("未检测到 Codex 客户端，请先打开客户端，再从飞书发送消息。");
@@ -133,27 +135,38 @@ export async function runDesktopTask({
   onControl({ canCancel: true, interrupt: () => interruption.request() });
   try {
     const threadId = await prepare({ ...options, cwd, threadId: existingId, model });
-    if (expectedTurnId && threadId !== existingId) throw resumeConflict();
+    if ((preserveThreadPlacement || expectedTurnId) && threadId !== existingId) throw resumeConflict();
     await onThread(threadId);
     const call = (tool, args, waitMs = 60_000) => callTool(pipePath, threadId, tool, args, waitMs);
-    // Use Desktop's own project operation as well as server metadata: it updates
-    // the sidebar's in-memory membership, so the user need not restart Desktop.
-    const catalog = await call("list_projects", {});
-    const projectId = matchingProjectId((catalog.projects || []).filter(p => p.projectKind === "local" && p.hostId === "local")
-      .map(p => ({ id: p.projectId, roots: [{ path: p.path }] })), cwd);
+    let projectId;
+    if (!preserveThreadPlacement) {
+      // Desktop's project operation also updates the sidebar's in-memory
+      // membership. Explicitly attached threads keep their original placement.
+      const catalog = await call("list_projects", {});
+      projectId = matchingProjectId((catalog.projects || []).filter(p => p.projectKind === "local" && p.hostId === "local")
+        .map(p => ({ id: p.projectId, roots: [{ path: p.path }] })), cwd);
+    }
 
     let baseline;
     try { baseline = await call("read_thread", { threadId, hostId: "local", turnLimit: 1, ...(continuationInputs.length ? { maxOutputCharsPerItem: 20_000 } : {}) }); }
     catch (error) { if (expectedTurnId) throw resumeConflict(); if (existingId) throw error; baseline = {}; }
     if (expectedTurnId && (baseline?.turns?.[0]?.id !== expectedTurnId || baseline.turns[0].status !== "interrupted" || baseline.thread?.status?.type === "active")) throw resumeConflict();
     if (baseline.thread?.status?.type === "active") throw new Error("这条会话正在 Codex 客户端执行任务，请等待完成后再从飞书发送消息。");
+    if (preserveThreadPlacement) {
+      if (baseline.thread?.id !== threadId || historyProjectPath(baseline.thread?.cwd).key !== historyProjectPath(cwd).key) {
+        throw new Error("附加会话的标识或目录已变化，请重新选择并附加。");
+      }
+      if (baseline.turns?.[0]?.status === "inProgress") throw new Error("这条会话正在 Codex 客户端执行任务，请等待完成后再从飞书发送消息。");
+      if (!["idle", "notLoaded"].includes(baseline.thread?.status?.type)) throw new Error("附加会话的状态尚未确认，请在客户端检查。");
+    }
     let previousTurnId = baseline.turns?.[0]?.id;
     const textInputs = expectedTurnId ? missingSteeringInputs(baseline.turns[0], continuationInputs, expectedInitialInputKind).map(item => item.prompt) : [];
     const desktopPrompt = imagePath ? `${prompt}\n\n用户上传的图片保存在本机：${JSON.stringify(imagePath)}。请先使用图片查看工具读取这张图片。` : prompt;
     if (!interruption.beginSubmission()) return { threadId, turn: { status: "interrupted" }, output: "任务在提交前已停止。" };
     let activeTurnId;
     if (expectedTurnId) {
-      const admitted = await startTurn(threadId, { prompt, textInputs, imagePath, model, effort, onSubmission });
+      const admitted = await startTurn(threadId, { prompt, textInputs, imagePath,
+        ...(model ? { model } : {}), ...(effort ? { effort } : {}), onSubmission });
       if (!admitted.turn?.id || admitted.turn.id === expectedTurnId || admitted.admissionOutcome && admitted.admissionOutcome !== "started") {
         throw Object.assign(new Error("客户端未确认独立续作轮次，请在客户端核对，避免重复提交。"), { submissionOutcomeUnknown: true });
       }

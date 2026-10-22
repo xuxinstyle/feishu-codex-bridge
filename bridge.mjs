@@ -44,6 +44,7 @@ import { TaskInterruption } from "./task-interruption.mjs";
 import { buildPanelCard, buildTaskCard } from "./feishu-cards.mjs";
 import { createHistoryReader } from "./codex-history.mjs";
 import { HistoryBrowser } from "./history-browser.mjs";
+import { inspectAttachmentRuntime } from "./thread-attachment.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
 const HOME_CONFIG_PATH = path.join(HOME_CONFIG_DIR, "config.env");
@@ -482,7 +483,7 @@ function getHelpMessage() {
     "- 连续发送多个任务会排队执行，不会自动取消前一个任务",
     "- 排队文字消息可点击「引导」提交给当前任务，不中断运行；也可发送 /steer 补充要求",
     "- /sessions：查看当前仓库的 Codex session",
-    "- /threads：在私聊中只读查看当前项目其他 Codex 会话及聊天记录",
+    "- /threads：私聊查看当前项目的 Codex 会话；/threads all 查看全部项目",
     "- /use <名字>：切换当前聊天窗口的 active session",
     "- /new <名字>：新建/重置命名 session 并切换过去",
     "- /new：清除当前 active session 映射",
@@ -672,6 +673,7 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "home
     .sort((a, b) => b.createdAt - a.createdAt);
   const task = tasks.find(t => ["running", "stopping"].includes(t.status)) || tasks.find(t => !["steered", "steer_unknown"].includes(t.status));
   return buildPanelCard({ chatId, projectPath, projectLabel: runner.projectAlias(projectPath), sessionName, task, notice, view, page,
+    attached: Boolean(runner.attachedSession(chatId, projectPath, sessionName)),
     model: runner.effectiveModel(chatId, projectPath), reasoning: runner.effectiveReasoning(chatId, projectPath),
     projects: config.bridge.projectChoices, models: config.codex.modelCatalog?.get(projectPath)?.models || [...(config.codex.modelGroups?.codex || []), ...(config.codex.modelGroups?.grok || [])],
     reasoningChoices: config.codex.reasoningEffortChoices || [], sessions: runner.sessionStates(chatId, projectPath),
@@ -782,9 +784,43 @@ class TaskRunner {
     return normalized;
   }
 
+  attachedSession(chatId, projectPath, sessionName = this.activeSessionName(chatId, projectPath)) {
+    const saved = this.sessions.get(sessionKey(chatId, projectPath, sessionName));
+    return saved?.attached ? saved : null;
+  }
+
+  attachSession(source, thread) {
+    if (config.codex.transport !== "desktop") throw new Error("附加现有会话需要使用 Codex 桌面通道。");
+    if (!existsSync(thread.cwd)) throw new Error("原会话目录已不存在，无法附加。");
+    const sourceProject = this.activeProjectPath(source.chatId);
+    if (this.pendingCountForSession(source.chatId, sourceProject, this.activeSessionName(source.chatId, sourceProject))) {
+      throw new Error("当前飞书会话仍有运行或排队任务，请处理完成后再附加。");
+    }
+    const found = [...this.sessions.entries()].find(([, saved]) => saved.threadId === thread.id);
+    if (found && !found[0].startsWith(`${source.chatId}::`)) throw new Error("该会话已绑定到另一飞书聊天，请先在原聊天中处理。");
+    let name = found?.[1].name;
+    if (name && this.pendingCountForSession(source.chatId, thread.cwd, name)) throw new Error("目标会话仍有运行或排队任务，请结束后重试。");
+    if (!name) {
+      const names = new Set(this.sessionStates(source.chatId, thread.cwd).map(item => item.name));
+      const base = normalizeSessionName(`Codex · ${thread.title || "未命名会话"}`);
+      name = base;
+      for (let suffix = 2; names.has(name); suffix++) name = `${base.slice(0, 40)} · ${suffix}`;
+    }
+    const key = sessionKey(source.chatId, thread.cwd, name);
+    const saved = this.sessions.get(key);
+    this.sessions.set(key, { ...saved, name, threadId: thread.id, backend: APP_SERVER_SESSION_BACKEND,
+      transport: "desktop", model: saved?.model || "", projectPath: thread.cwd, attached: true, attachedTitle: thread.title,
+      turns: saved?.turns || 0, updatedAt: new Date().toISOString() });
+    this.activeProjects.set(source.chatId, thread.cwd);
+    this.activeSessions.set(sessionScopeKey(source.chatId, thread.cwd), name);
+    this.markKnownSession(source.chatId, thread.cwd, name);
+    this.persistSessionState();
+    return { sessionName: name, projectPath: thread.cwd, threadId: thread.id };
+  }
+
   activeProjectPath(chatId) {
     const projectPath = this.activeProjects.get(chatId);
-    if (projectPath && existsSync(projectPath)) return projectPath;
+    if (projectPath && (existsSync(projectPath) || this.attachedSession(chatId, projectPath))) return projectPath;
     return config.bridge.defaultProjectPath;
   }
 
@@ -849,15 +885,20 @@ class TaskRunner {
     return lines.join("\n");
   }
 
-  modelOverride(chatId, projectPath) {
+  modelOverride(chatId, projectPath, sessionName) {
+    const attached = this.attachedSession(chatId, projectPath, sessionName);
+    if (attached) return attached.attachedModelOverride || "";
     return this.modelOverrides.get(sessionScopeKey(chatId, projectPath)) || "";
   }
 
-  reasoningOverride(chatId, projectPath) {
+  reasoningOverride(chatId, projectPath, sessionName) {
+    const attached = this.attachedSession(chatId, projectPath, sessionName);
+    if (attached) return attached.attachedReasoningOverride || "";
     return this.reasoningOverrides.get(sessionScopeKey(chatId, projectPath)) || "";
   }
 
   effectiveModel(chatId, projectPath) {
+    if (this.attachedSession(chatId, projectPath)) return this.modelOverride(chatId, projectPath);
     return effectiveCodexModel({
       configuredModel: config.codex.model,
       defaultModel: config.codex.defaultModel,
@@ -866,6 +907,7 @@ class TaskRunner {
   }
 
   effectiveReasoning(chatId, projectPath) {
+    if (this.attachedSession(chatId, projectPath)) return this.reasoningOverride(chatId, projectPath);
     return effectiveReasoningEffort({
       configuredEffort: config.codex.reasoningEffort,
       defaultEffort: config.codex.defaultReasoningEffort,
@@ -876,6 +918,7 @@ class TaskRunner {
   modelInfo(chatId, projectPath) {
     const scopedModel = this.modelOverride(chatId, projectPath);
     const scopedReasoning = this.reasoningOverride(chatId, projectPath);
+    if (this.attachedSession(chatId, projectPath)) return `当前为附加的 Codex 会话。\n模型: ${scopedModel || "沿用原会话模型"}\n推理强度: ${scopedReasoning || "沿用原会话设置"}\n/model default 可恢复沿用原设置。`;
     const effectiveReasoning = this.effectiveReasoning(chatId, projectPath) || "未设置";
     const reasoningLine = scopedReasoning
       ? `当前推理强度覆盖: ${scopedReasoning}`
@@ -892,24 +935,32 @@ class TaskRunner {
   }
 
   setModelOverride(chatId, projectPath, model) {
+    const attached = this.attachedSession(chatId, projectPath);
+    if (attached) { attached.attachedModelOverride = model; this.persistSessionState(); return model; }
     this.modelOverrides.set(sessionScopeKey(chatId, projectPath), model);
     this.persistSessionState();
     return model;
   }
 
   clearModelOverride(chatId, projectPath) {
+    const attached = this.attachedSession(chatId, projectPath);
+    if (attached) { const had = Boolean(attached.attachedModelOverride); delete attached.attachedModelOverride; this.persistSessionState(); return had; }
     const existed = this.modelOverrides.delete(sessionScopeKey(chatId, projectPath));
     this.persistSessionState();
     return existed;
   }
 
   setReasoningOverride(chatId, projectPath, effort) {
+    const attached = this.attachedSession(chatId, projectPath);
+    if (attached) { attached.attachedReasoningOverride = effort; this.persistSessionState(); return effort; }
     this.reasoningOverrides.set(sessionScopeKey(chatId, projectPath), effort);
     this.persistSessionState();
     return effort;
   }
 
   clearReasoningOverride(chatId, projectPath) {
+    const attached = this.attachedSession(chatId, projectPath);
+    if (attached) { const had = Boolean(attached.attachedReasoningOverride); delete attached.attachedReasoningOverride; this.persistSessionState(); return had; }
     const existed = this.reasoningOverrides.delete(sessionScopeKey(chatId, projectPath));
     this.persistSessionState();
     return existed;
@@ -994,7 +1045,7 @@ class TaskRunner {
     if (!task.turnId && ["submitting", "submitted"].includes(task.submissionState)) {
       throw new Error("原任务的提交结果尚未确认，不能重复发送，请在 Codex 客户端检查。");
     }
-    if (!task.resumeOperation) task.resumeOperation = this.create(source, task.projectPath,
+    if (!task.resumeOperation) task.resumeOperation = this.create({ ...source, chatType: task.source.chatType }, task.projectPath,
       task.prompt, task.sessionName, task.imageKey, {
         threadId, expectedTurnId, executionPrompt: expectedTurnId ? "继续" : task.executionPrompt || task.prompt,
         resumeFromTaskId: task.taskId, rootTaskId: task.rootTaskId || task.taskId,
@@ -1093,6 +1144,8 @@ class TaskRunner {
 
   async create(source, projectPath, prompt, sessionName, imageKey = "", resume = null) {
     const normalizedSessionName = normalizeSessionName(sessionName);
+    const attached = this.attachedSession(source.chatId, projectPath, normalizedSessionName);
+    if (attached && source.chatType !== "p2p") throw new Error("附加的 Codex 会话仅允许在私聊中继续。");
     const ahead = this.pendingCountForSession(source.chatId, projectPath, normalizedSessionName);
     const steerTarget = this.steering.active(source.chatId, projectPath, normalizedSessionName);
     const task = {
@@ -1110,6 +1163,8 @@ class TaskRunner {
       contextImagePath: resume?.contextImagePath || null,
       imageMessageId: resume?.imageMessageId || source.messageId,
       resumeThreadId: resume?.threadId || null,
+      attachedThreadId: attached?.threadId || null,
+      attachedTitle: attached?.attachedTitle || "",
       resumeTurnId: resume?.expectedTurnId || null,
       resumeSteeringInputs: resume?.continuationInputs || [],
       resumeInitialInputKind: resume?.expectedInitialInputKind,
@@ -1124,14 +1179,14 @@ class TaskRunner {
       threadId: null,
       progress: "",
       lastEventAt: null,
-      modelOverride: this.modelOverride(source.chatId, projectPath),
-      reasoningOverride: resume ? resume.reasoningOverride : this.reasoningOverride(source.chatId, projectPath),
-      model: resume?.model || this.effectiveModel(source.chatId, projectPath),
+      modelOverride: this.modelOverride(source.chatId, projectPath, normalizedSessionName),
+      reasoningOverride: resume ? resume.reasoningOverride : this.reasoningOverride(source.chatId, projectPath, normalizedSessionName),
+      model: resume?.model ?? (attached ? this.modelOverride(source.chatId, projectPath, normalizedSessionName) : this.effectiveModel(source.chatId, projectPath)),
       steerTargetTaskId: steerTarget?.taskId,
       sessionGeneration: this.sessionGenerations.get(sessionKey(source.chatId, projectPath, normalizedSessionName)) || 0,
     };
     task.initialInputKind = config.codex.transport === "desktop" && !task.resumeTurnId ? "functionCallOutput" : "userMessage";
-    task.effort = resume && resume.effort !== undefined ? resume.effort : effectiveReasoningEffort({
+    task.effort = resume && resume.effort !== undefined ? resume.effort : attached ? task.reasoningOverride : effectiveReasoningEffort({
       configuredEffort: config.codex.reasoningEffort,
       defaultEffort: config.codex.defaultReasoningEffort,
       scopedEffort: task.reasoningOverride,
@@ -1172,6 +1227,7 @@ class TaskRunner {
     const existing = this.sessions.get(key);
     this.markKnownSession(task.source.chatId, task.projectPath, task.sessionName);
     this.sessions.set(key, {
+      ...(existing?.threadId === threadId ? existing : {}),
       name: task.sessionName,
       threadId,
       backend: APP_SERVER_SESSION_BACKEND,
@@ -1264,8 +1320,9 @@ class TaskRunner {
 
       if (task.stopRequested || task.status === "cancelled") { task.status = task.stopRequested ? "interrupted" : "cancelled"; return; }
       const existing = this.sessions.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
-      const threadId = task.resumeThreadId || (canResumeAppServerSession(existing, task.model) ? existing.threadId : null);
-      const name = `[飞书] ${path.basename(task.projectPath)} · ${task.sessionName}`;
+      if (task.attachedThreadId && config.codex.transport !== "desktop") throw new Error("附加会话需要 Codex 桌面通道，不能自动创建替代会话。");
+      const threadId = task.resumeThreadId || task.attachedThreadId || (canResumeAppServerSession(existing, task.model) ? existing.threadId : null);
+      const name = task.attachedTitle || `[飞书] ${path.basename(task.projectPath)} · ${task.sessionName}`;
       log("info", "starting Codex task", {
         taskId: task.taskId, cwd: task.projectPath, command: codexLauncher.command, threadId, transport: config.codex.transport,
       });
@@ -1278,6 +1335,7 @@ class TaskRunner {
         cwd: task.projectPath,
         env: { ...process.env, CODEX_HOME: codexHome },
         threadId,
+        preserveThreadPlacement: Boolean(task.attachedThreadId),
         expectedTurnId: task.resumeTurnId,
         continuationInputs: task.resumeSteeringInputs,
         expectedInitialInputKind: task.resumeInitialInputKind,
@@ -1297,6 +1355,7 @@ class TaskRunner {
         onTurnStarted: ({ turnId }) => { task.turnId = turnId; task.resumeSteeringInputs = []; },
         onSubmission: state => { task.submissionState = state; },
         onThread: (id) => {
+          if (task.attachedThreadId && id !== task.attachedThreadId) throw new Error("附加会话标识发生变化，已拒绝切换到替代会话。");
           task.threadId = id;
           task.desktopName = name;
           this.saveAppServerSession(task, id);
@@ -1513,6 +1572,10 @@ async function handleMessage(message) {
   const command = message.imageKey
     ? { type: "run", prompt: message.text || "请分析这张图片并回答。" }
     : parseCommand(message.text);
+  if (pendingAttachments.has(message.chatId) && ["run", "resume"].includes(command.type)) {
+    await messenger.replyText(message.messageId, "正在附加 Codex 会话，请看到附加成功后再发送任务。");
+    return;
+  }
   if (command.type === "help") {
     await messenger.replyText(message.messageId, getHelpMessage());
     return;
@@ -1523,7 +1586,7 @@ async function handleMessage(message) {
       return;
     }
     if (command.invalidArgs) {
-      await messenger.replyText(message.messageId, "请直接发送 /threads 查看列表，再点击会话查看内容。");
+      await messenger.replyText(message.messageId, "发送 /threads 查看当前项目，或 /threads all 查看全部项目，再点击会话查看内容。");
       return;
     }
     const messageId = await showControlCard(message.chatId, message.messageId, "正在读取本地会话…");
@@ -1531,7 +1594,7 @@ async function handleMessage(message) {
     const revision = nextControlCardRevision(messageId);
     const scope = historyScope(message.chatId, message.senderId, messageId);
     try {
-      const card = await getHistoryBrowser().open(scope);
+      const card = await getHistoryBrowser().open(scope, { allProjects: command.allProjects });
       await deliverHistoryCard(scope, revision, card);
     } catch (error) {
       log("warn", "local history request failed", { error: String(error) });
@@ -1731,6 +1794,10 @@ async function handleMessage(message) {
   }
 
   const sessionName = runner.activeSessionName(message.chatId, projectPath);
+  if (runner.attachedSession(message.chatId, projectPath, sessionName) && !allowedUserIds.has(message.senderId)) {
+    await messenger.replyText(message.messageId, "请先完成配对，再继续附加的 Codex 会话。");
+    return;
+  }
   const task = await runner.create(
     {
       messageId: message.messageId,
@@ -1747,6 +1814,7 @@ async function handleMessage(message) {
 }
 
 const historyChatOwners = new Map();
+const pendingAttachments = new Map();
 let historyBrowser;
 function historyAllowed(chatId, senderId) {
   return allowedUserIds.has(senderId) && historyChatOwners.get(chatId) === senderId;
@@ -1761,7 +1829,7 @@ function getHistoryBrowser() {
   }) });
 }
 
-const historyActions = new Set(["show_history", "show_history_thread", "show_history_text", "show_history_refresh", "show_history_batch"]);
+const historyActions = new Set(["show_history", "show_history_thread", "show_history_text", "show_history_refresh", "show_history_batch", "show_history_scope", "show_history_list"]);
 
 const executeCardActionSerially = createKeyedSerialExecutor();
 const cardActionDeduper = createMessageDeduper();
@@ -1812,7 +1880,7 @@ async function handleCardAction(raw) {
   const value = parseCardActionValue(event.action?.value);
   if (allowedUserIds.size > 0 && !allowedUserIds.has(event.operator.openId)) return toast("你没有操作权限。", "error");
   if (value?.bridge !== CARD_BRIDGE_ID || (value.scopeChatId && value.scopeChatId !== event.chatId)) return toast("卡片不属于当前聊天，请发送 /panel。", "error");
-  if (historyActions.has(value.action)) {
+  if (historyActions.has(value.action) || value.action === "attach_history") {
     if (value.scopeChatId !== event.chatId || !historyAllowed(event.chatId, event.operator.openId)) return toast("请在已配对的机器人私聊中发送 /threads。", "error");
     if (!event.messageId || runner.controlCardMessageId(event.chatId) !== event.messageId) return toast("页面已过期，请发送 /threads 重新打开。", "warning");
   }
@@ -1821,6 +1889,7 @@ async function handleCardAction(raw) {
   const isTaskAction = ["steer_task", "stop_task", "cancel_task", "resume_task"].includes(value.action) || value.action === "show_queue" && value.taskId;
   if (isTaskAction) {
     const task = runner.tasks.get(value.taskId);
+    if (task?.attachedThreadId && !allowedUserIds.has(event.operator.openId)) return toast("你没有操作权限。", "error");
     const ownCard = task?.statusMessageId === event.messageId || value.action === "steer_task" && task?.steerCardMessageId === event.messageId;
     const panel = runner.controlCardMessageId(event.chatId) === event.messageId;
     if (!task || task.source.chatId !== event.chatId || task.source.senderId !== event.operator.openId || (!ownCard && !panel) || value.generation !== undefined && value.generation !== task.generation) {
@@ -1837,6 +1906,10 @@ async function handleCardAction(raw) {
     try { await messenger.replyText(event.messageId, "操作未完成，请发送 /panel 重试。若已点击停止，请在任务卡或 Codex 客户端核对状态。"); }
     catch (deliveryError) { log("warn", "card action error delivery failed", { error: String(deliveryError) }); }
   };
+  if (value.action === "attach_history") {
+    void executeCardActionSerially(`${event.messageId}:attach`, () => handleAttachHistory(event, value)).catch(onError);
+    return toast("正在附加 Codex 会话…");
+  }
   if (historyActions.has(value.action)) {
     void handleHistoryCardAction(event, value, event.panelRevision).catch(onError);
     return toast("正在读取本地会话…");
@@ -1877,6 +1950,32 @@ async function handleHistoryCardAction(event, value, revision) {
       "本地会话读取未完成，页面可能已过期或接口暂不可用。请点击本地会话重试。");
   }
   await deliverHistoryCard(scope, revision, card);
+}
+
+async function handleAttachHistory(event, value) {
+  const scope = historyScope(event.chatId, event.operator.openId, event.messageId);
+  const sourceSession = runner.activeSessionName(scope.chatId, scope.projectPath);
+  const current = () => historyAllowed(scope.chatId, scope.ownerId) && runner.controlCardMessageId(scope.chatId) === scope.panelId &&
+    controlCardRevisions.get(scope.panelId) === event.panelRevision && runner.activeProjectPath(scope.chatId) === scope.projectPath &&
+    runner.activeSessionName(scope.chatId, scope.projectPath) === sourceSession;
+  if (!current()) return;
+  pendingAttachments.set(scope.chatId, event.panelRevision);
+  let card;
+  try {
+    const thread = await getHistoryBrowser().attachment(value, scope);
+    await inspectAttachmentRuntime(thread);
+    if (!current()) return;
+    const result = runner.attachSession({ chatId: scope.chatId, senderId: scope.ownerId }, thread);
+    card = buildControlCard(runner, scope.chatId, result.projectPath,
+      `已附加「${thread.title}」。直接发送消息即可在原会话继续，原模型和推理设置将沿用。`);
+  } catch (error) {
+    log("warn", "thread attachment failed", { error: String(error) });
+    if (!current()) return;
+    card = buildControlCard(runner, scope.chatId, scope.projectPath, `附加未完成：${error.message}`);
+  } finally {
+    if (pendingAttachments.get(scope.chatId) === event.panelRevision) pendingAttachments.delete(scope.chatId);
+  }
+  return deliverPanelCard(event, card);
 }
 
 async function deliverHistoryCard(scope, revision, card) {
@@ -2116,6 +2215,7 @@ log("info", "starting Feishu Codex bridge", {
   cardCallbacks: "immediate-v2",
   cardRedraw: "revision-v1",
   taskControl: "interrupt-v1",
+  sessionAttachment: "desktop-existing-v1",
 });
 await wsClient.start({ eventDispatcher: dispatcher });
 log("info", "Feishu WebSocket connected; waiting for messages");

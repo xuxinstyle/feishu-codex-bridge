@@ -10,7 +10,8 @@
     "test": "node --test test/*.test.mjs",
     "preview:cards": "node scripts/preview-cards.mjs --serve",
     "test:live": "node scripts/verify-task-resume.mjs",
-    "test:history:live": "node scripts/verify-history.mjs"
+    "test:history:live": "node scripts/verify-history.mjs",
+    "test:attach:live": "node scripts/verify-thread-attachment.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.1.1"

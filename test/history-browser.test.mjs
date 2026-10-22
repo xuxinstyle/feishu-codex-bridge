@@ -85,6 +85,63 @@ test("empty filtered pages retain next navigation and expose no task controls", 
   assert.ok(!JSON.stringify(card).includes("nextCursor"));
 });
 
+test("global lists select only the stored source project and preserve it through reads and return navigation", async () => {
+  const calls = [];
+  const external = "E:\\another-repo";
+  const reader = {
+    list: async args => { calls.push(["list", args]); return { threads: [{ id: "outside", title: "其他项目", cwd: external }], nextCursor: "list-page" }; },
+    read: async args => { calls.push(["read", args]); return { thread: { id: "outside", title: "其他项目", cwd: external },
+      messages: [{ role: "assistant", text: "历史正文" }], nextCursor: args.cursor ? null : "turn-page" }; },
+  };
+  const browser = new HistoryBrowser({ reader });
+  const initial = await browser.open(scope);
+  const global = await browser.act(value(initial, "show_history_scope"), scope);
+  assert.equal(calls.at(-1)[1].allProjects, true);
+  const older = await browser.act(value(global, "show_history_batch"), scope);
+  assert.equal(calls.at(-1)[1].cursor, "list-page");
+  let card = await browser.act({ ...value(older, "show_history_thread"), cwd: "Z:\\injected", targetProjectPath: "Z:\\injected" }, scope);
+  assert.equal(calls.at(-1)[1].projectPath, external);
+  card = await browser.act(value(card, "show_history_batch"), scope);
+  assert.equal(calls.at(-1)[1].projectPath, external);
+  card = await browser.act(value(card, "show_history_refresh"), scope);
+  assert.equal(calls.at(-1)[1].projectPath, external);
+  const count = calls.length;
+  card = await browser.act(value(card, "show_history_list"), scope);
+  assert.equal(calls.length, count, "Returning should restore the saved list without resetting its cursor");
+  assert.ok(JSON.stringify(card).includes("全部项目"));
+  assert.ok(buttons(card).some(button => button.value.direction === "newer"));
+  const restored = await browser.act(value(card, "show_history_refresh"), scope);
+  assert.equal(calls.at(-1)[1].allProjects, true);
+  await browser.act(value(restored, "show_history_scope"), scope);
+  assert.equal(calls.at(-1)[1].allProjects, false);
+});
+
+test("global list entries need a confirmed source cwd and range actions require a boolean", async () => {
+  const { browser, calls } = fixture();
+  const global = await browser.open(scope, { allProjects: true });
+  await assert.rejects(browser.act(value(global, "show_history_thread"), scope), /项目未确认/);
+  for (const allProjects of [undefined, "true", 1, null]) {
+    await assert.rejects(browser.act({ ...value(global, "show_history_scope"), allProjects }, scope), /范围无效/);
+  }
+  assert.equal(calls.length, 1);
+});
+
+test("attachment revalidates only the stored thread and project and never executes a model turn", async () => {
+  const checks = [];
+  const { browser } = fixture();
+  browser.reader.inspect = async args => { checks.push(args); return { id: args.threadId, cwd: args.projectPath, title: "原会话", status: "idle" }; };
+  const list = await browser.open(scope);
+  await assert.rejects(browser.attachment(value(list, "show_history_thread"), scope), /过期/);
+  const card = await browser.act(value(list, "show_history_thread"), scope);
+  const attach = value(card, "attach_history");
+  assert.ok(buttons(card).find(button => button.value.action === "attach_history").confirm);
+  const selected = await browser.attachment({ ...attach, threadId: "forged", cwd: "Z:\\forged" }, scope);
+  assert.equal(selected.id, "thread");
+  assert.deepEqual(checks, [{ projectPath: scope.projectPath, threadId: "thread" }]);
+  for (const key of Object.keys(scope)) await assert.rejects(browser.attachment(attach, { ...scope, [key]: "foreign" }), /过期/);
+  assert.equal(checks.length, 1);
+});
+
 test("cache evicts by byte budget, drops duplicate message copies and proactively expires", async t => {
   let now = 1;
   const { browser } = fixture({ maxBytes: 40_000, ttlMs: 25, now: () => now });

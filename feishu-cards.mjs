@@ -85,7 +85,7 @@ export function buildPanelCard(state) {
       projects ? row([btn("刷新列表", "refresh")]) : null, projects ? back : backSettings]);
   }
   if (view === "settings") return shell("会话设置", "blue", [message, context,
-    md(`**模型**\n${clean(state.model || "使用默认配置")}\n\n**推理强度**\n${clean(reasoningLabel(state.reasoning))}`),
+    md(`**模型**\n${clean(state.model || (state.attached ? "沿用原会话模型" : "使用默认配置"))}\n\n**推理强度**\n${clean(state.attached && !state.reasoning ? "沿用原会话设置" : reasoningLabel(state.reasoning))}`),
     row([btn("选择模型", "show_models"), btn("推理强度", "show_reasoning")]),
     row([btn("恢复默认", "reset_settings"), btn("重置会话", "reset_active_session", {}, "danger", {
       title: { tag: "plain_text", content: "重置会话？" }, text: { tag: "plain_text", content: "下一条消息会开启新上下文，历史聊天仍保留。" },
@@ -96,6 +96,7 @@ export function buildPanelCard(state) {
     ...pageEntries.map(s => row([btn(`${s.name === sessionName ? "✓ " : ""}${sessionLabel(s.name)} · ${s.summary ? short(s.summary, 38) : stateLabel(s.status)}`,
       "use_session", { sessionName: s.name }, s.name === sessionName ? "primary" : "default")])),
     ...pagination("show_sessions"),
+    row([btn("查看 Codex 会话", "show_history")]),
     row([btn("新建会话", "new_session", {}, "primary")]), back]);
   if (view === "queue") {
     const queued = state.queued || [];
@@ -106,6 +107,7 @@ export function buildPanelCard(state) {
       state.paused && queued.length ? row([btn("按顺序执行待办", "resume_queue", {}, "primary")]) : null, back]);
   }
   if (view === "help") return shell("使用帮助", "blue", [message, context,
+    md("**已有 Codex 会话**\n打开本地会话，或发送 /threads all 查看全部项目。选中会话后点击「附加到飞书」，后续消息将在原上下文继续。"),
     md("**开始任务**\n直接发送文字或图片，使用当前项目和会话。"),
     md("**停止与继续**\n点击任务卡的停止按钮，或发送 /stop。停止后点击继续，或发送 /resume；会在保留上下文的新一轮中续作，已完成的修改不会撤销。"),
     md("**补充要求**\n任务执行时发送 /steer 补充要求，或发送消息后点击「补充给当前任务」。普通消息会排队。"),
@@ -116,7 +118,8 @@ export function buildPanelCard(state) {
   if (task?.status === "interrupted" && !task.resumedAs) actions.push(btn("继续当前任务", "resume_task", { taskId: task.taskId, generation: task.generation }, "primary"));
   const color = ["interrupted", "stopping"].includes(task?.status) ? "orange" : task ? "blue" : "grey";
   return shell("Codex", color, [message, md(`**${clean(projectLabel)}** / ${clean(sessionLabel(sessionName))}`),
-    note(`${state.model || "默认模型"} · 推理${reasoningLabel(state.reasoning)}`),
+    note(`${state.model || (state.attached ? "沿用原会话模型" : "默认模型")} · ${state.attached && !state.reasoning ? "沿用原推理设置" : `推理${reasoningLabel(state.reasoning)}`}`),
+    state.attached ? note("已附加 Codex 会话 · 消息在原上下文中继续") : null,
     task ? md(`**${stateLabel(task.status)}**\n${clean(short(task.prompt, 130))}`) : md("直接发送消息，开始一个任务。"),
     task?.stopError ? note("停止结果尚未确认，可重试或在客户端检查。") : null,
     state.paused && state.queued?.length ? note("旧待办仍暂停，可在待办中恢复。") : null,

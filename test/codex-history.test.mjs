@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createHistoryReader } from "../codex-history.mjs";
+import { createHistoryReader, historyProjectPath } from "../codex-history.mjs";
 
 const projectPath = "E:\\mycode\\repo";
 const thread = (extra = {}) => ({ id: "thread-1", name: "历史会话", cwd: projectPath, updatedAt: 123,
@@ -37,7 +37,7 @@ function fixture(handle, options = {}) {
 test("list uses a bounded indexed page and forwards the opaque cursor", async () => {
   const f = fixture(() => ({ data: [thread()], nextCursor: "page-two" }));
   assert.deepEqual(await f.reader.list({ projectPath, cursor: "opaque-page" }), {
-    threads: [{ id: "thread-1", title: "历史会话", updatedAt: 123, status: "notLoaded" }], nextCursor: "page-two",
+    threads: [{ id: "thread-1", title: "历史会话", cwd: projectPath, updatedAt: 123, status: "notLoaded" }], nextCursor: "page-two",
   });
   assert.deepEqual(f.requests[1], { method: "thread/list", params: { cwd: projectPath, cursor: "opaque-page", limit: 20,
     archived: false, sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true,
@@ -66,14 +66,14 @@ test("path matching supports UNC and retains POSIX case sensitivity", async () =
   assert.deepEqual((await posix.reader.list({ projectPath: "/home/me/repo/." })).threads.map(t => t.id), ["ok"]);
 });
 
-test("filtered empty pages preserve pagination and fallback titles/status remain predictable", async () => {
-  const f = fixture(() => ({ data: [thread({ name: "[飞书] hidden" })], nextCursor: "more" }));
-  assert.deepEqual(await f.reader.list({ projectPath }), { threads: [], nextCursor: "more" });
+test("filtered empty final pages stop and fallback titles/status remain predictable", async () => {
+  const f = fixture(() => ({ data: [thread({ name: "[飞书] hidden" })], nextCursor: null }));
+  assert.deepEqual(await f.reader.list({ projectPath }), { threads: [], nextCursor: null });
   const empty = fixture(() => ({ data: [thread({ name: null, preview: "首行\n第二行", updatedAt: null, status: "idle" }),
     thread({ id: "unnamed", name: "", preview: "", status: null })], nextCursor: null }));
   assert.deepEqual((await empty.reader.list({ projectPath })).threads, [
-    { id: "thread-1", title: "首行", updatedAt: null, status: "idle" },
-    { id: "unnamed", title: "未命名会话", updatedAt: 123, status: "unknown" },
+    { id: "thread-1", title: "首行", cwd: projectPath, updatedAt: null, status: "idle" },
+    { id: "unnamed", title: "未命名会话", cwd: projectPath, updatedAt: 123, status: "unknown" },
   ]);
 });
 
@@ -226,4 +226,203 @@ test("empty read pages preserve nextCursor instead of inventing messages from un
   assert.deepEqual(result.messages, []);
   assert.equal(result.nextCursor, "older");
   assert.equal(f.connections[0].closed, 1);
+});
+
+test("global list omits the RPC cwd filter and returns canonical absolute cwd for each thread", async () => {
+  const f = fixture(() => ({ data: [
+    thread({ id: "windows", cwd: "\\\\?\\E:\\mycode\\repo\\.\\" }),
+    thread({ id: "other", cwd: "F:/different/project/" }),
+    thread({ id: "unc", cwd: "\\\\?\\UNC\\host\\share\\repo\\" }),
+    thread({ id: "posix", cwd: "/home/me/../other/repo/" }),
+    ...[null, "", "relative/project", "E:relative", 42, "E:\\bad\0path"].map(cwd => thread({ cwd })),
+    thread({ name: "[飞书] private" }), thread({ source: "subAgent" }),
+    thread({ source: { subAgent: {} } }), thread({ parentThreadId: "parent" }),
+  ], nextCursor: "next" }));
+  const result = await f.reader.list({ allProjects: true });
+  assert.deepEqual(result.threads.map(({ id, cwd }) => ({ id, cwd })), [
+    { id: "windows", cwd: projectPath }, { id: "other", cwd: "F:\\different\\project" },
+    { id: "unc", cwd: "\\\\host\\share\\repo" }, { id: "posix", cwd: "/home/other/repo" },
+  ]);
+  assert.equal(result.nextCursor, "next");
+  assert.equal(Object.hasOwn(f.requests[1].params, "cwd"), false);
+  assert.equal(f.connections[0].closed, 1);
+});
+
+test("global listing ignores the browsing project while current mode stays exact", async () => {
+  const f = fixture(() => ({ data: [thread(), thread({ id: "other", cwd: "F:\\different" }),
+    thread({ id: "child", cwd: `${projectPath}\\child` })], nextCursor: null }));
+  assert.deepEqual((await f.reader.list({ projectPath, allProjects: true })).threads.map(t => t.id), ["thread-1", "other", "child"]);
+  assert.deepEqual((await f.reader.list({ projectPath, allProjects: false })).threads.map(t => t.id), ["thread-1"]);
+  assert.equal(f.requests.filter(r => r.method === "thread/list")[1].params.cwd, projectPath);
+  for (const allProjects of ["true", 1, null, {}]) await assert.rejects(f.reader.list({ projectPath, allProjects }), /boolean/);
+});
+
+test("global selection never authorizes read without the exact selected cwd", async () => {
+  const otherPath = "F:\\different\\project";
+  const f = fixture(method => {
+    if (method === "thread/list") return { data: [thread({ cwd: otherPath })] };
+    if (method === "thread/read") return { thread: thread({ cwd: otherPath }) };
+    return { data: [{ items: [user("selected project"), assistant("reply")] }] };
+  });
+  const selected = (await f.reader.list({ projectPath, allProjects: true })).threads[0];
+  assert.equal(selected.cwd, otherPath);
+  await assert.rejects(f.reader.read({ threadId: selected.id, allProjects: true }), /absolute path/);
+  await assert.rejects(f.reader.read({ projectPath, threadId: selected.id, allProjects: true }), /unavailable/);
+  await assert.rejects(f.reader.read({ projectPath: `${otherPath}\\child`, threadId: selected.id }), /unavailable/);
+  assert.equal(f.requests.filter(r => r.method === "thread/turns/list").length, 0);
+  const result = await f.reader.read({ projectPath: selected.cwd, threadId: selected.id });
+  assert.equal(result.thread.cwd, otherPath);
+  assert.equal(result.messages.length, 2);
+  assert.ok(f.connections.every(connection => connection.closed === 1));
+});
+
+test("both list scopes skip filtered pages, stop at the first visible page and return its next cursor", async () => {
+  for (const allProjects of [false, true]) {
+    const f = fixture((_method, params) => {
+      if (params.cursor === "initial") return { data: [thread({ name: "[飞书] hidden" })], nextCursor: "second" };
+      if (params.cursor === "second") return { data: [thread({ source: "subAgent" }), thread({ cwd: "relative" })], nextCursor: "third" };
+      assert.equal(params.cursor, "third");
+      return { data: [thread()], nextCursor: "fourth" };
+    });
+    const result = await f.reader.list({ projectPath, allProjects, cursor: "initial" });
+    assert.equal(result.threads.length, 1);
+    assert.equal(result.nextCursor, "fourth");
+    assert.deepEqual(f.requests.filter(r => r.method === "thread/list").map(r => r.params.cursor), ["initial", "second", "third"]);
+    assert.equal(f.connections.length, 1);
+    assert.equal(f.connections[0].closed, 1);
+  }
+});
+
+test("five-page bound preserves the last actual cursor and a later operation can continue", async () => {
+  const f = fixture((_method, { cursor }) => {
+    const page = cursor === null ? 0 : Number(cursor);
+    return { data: [thread(page < 5 ? { name: "[飞书] hidden" } : {})], nextCursor: String(page + 1) };
+  });
+  assert.deepEqual(await f.reader.list({ allProjects: true }), { threads: [], nextCursor: "5" });
+  assert.equal(f.requests.filter(r => r.method === "thread/list").length, 5);
+  const next = await f.reader.list({ allProjects: true, cursor: "5" });
+  assert.equal(next.threads.length, 1);
+  assert.equal(next.nextCursor, "6");
+  assert.equal(f.connections.length, 2);
+  assert.ok(f.connections.every(connection => connection.closed === 1));
+});
+
+test("filtered pages stop when the server runs out of history", async () => {
+  const f = fixture((_method, { cursor }) => ({ data: [], nextCursor: cursor ? null : "last" }));
+  assert.deepEqual(await f.reader.list({ projectPath }), { threads: [], nextCursor: null });
+  assert.equal(f.requests.filter(r => r.method === "thread/list").length, 2);
+});
+
+test("multi-page cursor cycles are detected even when they return to the supplied cursor", async () => {
+  for (const initial of [null, "seed"]) {
+    let calls = 0;
+    const f = fixture(() => ({ data: [], nextCursor: ["a", "b", initial || "a"][calls++] }));
+    await assert.rejects(f.reader.list({ allProjects: true, cursor: initial }), /cursor cycle/);
+    assert.equal(calls, 3);
+    assert.equal(f.connections[0].closed, 1);
+  }
+});
+
+test("a failure on a skipped page closes the shared connection and propagates the error", async () => {
+  const error = new Error("history unavailable");
+  const f = fixture((_method, { cursor }) => { if (cursor) throw error; return { data: [], nextCursor: "next" }; });
+  await assert.rejects(f.reader.list({ allProjects: true }), actual => actual === error);
+  assert.equal(f.connections[0].closed, 1);
+});
+
+test("one operation deadline covers skipped pages and prevents late replies from issuing more reads", async () => {
+  let reply;
+  const f = fixture((_method, { cursor }) => cursor
+    ? new Promise(resolve => { reply = resolve; })
+    : { data: [], nextCursor: "second" }, { timeoutMs: 40 });
+  await assert.rejects(f.reader.list({ allProjects: true }), /timed out/);
+  assert.equal(f.connections.length, 1);
+  assert.equal(f.connections[0].closed, 1);
+  reply({ data: [], nextCursor: "third" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.requests.filter(r => r.method === "thread/list").length, 2);
+});
+
+test("the shared path normalizer exports canonical paths and exact comparison keys", () => {
+  assert.deepEqual(historyProjectPath("\\\\?\\E:\\MYCODE\\repo\\.\\"), { path: "E:\\MYCODE\\repo", key: "e:\\mycode\\repo" });
+  assert.deepEqual(historyProjectPath("E:/mycode/../repo/"), { path: "E:\\repo", key: "e:\\repo" });
+  assert.deepEqual(historyProjectPath("\\\\?\\UNC\\HOST\\share\\repo\\"), {
+    path: "\\\\HOST\\share\\repo", key: "\\\\host\\share\\repo",
+  });
+  assert.deepEqual(historyProjectPath("C:\\"), { path: "C:\\", key: "c:\\" });
+  assert.deepEqual(historyProjectPath("/home/User/repo/../repo/"), { path: "/home/User/repo", key: "/home/User/repo" });
+  assert.notEqual(historyProjectPath("/home/User").key, historyProjectPath("/home/user").key);
+  for (const value of [undefined, null, 42, "", "relative", "C:relative", "C:\\invalid\0path"]) {
+    assert.throws(() => historyProjectPath(value), /absolute path/);
+  }
+});
+
+test("inspect returns canonical metadata only and never requests turns or changes the session", async () => {
+  const f = fixture(() => ({ thread: thread({ cwd: "\\\\?\\E:\\MYCODE\\repo\\.\\", model: "model", projectId: "project",
+    reasoningEffort: "high", turns: [{ items: [assistant("must not leak")] }] }) }));
+  assert.deepEqual(await f.reader.inspect({ projectPath: "e:/mycode/repo/", threadId: "thread-1" }), {
+    id: "thread-1", title: "历史会话", cwd: "E:\\MYCODE\\repo", status: "notLoaded",
+  });
+  assert.deepEqual(f.requests, [{ method: "initialize" },
+    { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } }]);
+  assert.equal(f.connections[0].closed, 1);
+});
+
+test("inspect uses fresh metadata and rejects moved, renamed, subagent and mismatched threads", async () => {
+  let metadata = thread();
+  const f = fixture(() => ({ thread: metadata }));
+  const selected = await f.reader.inspect({ projectPath, threadId: "thread-1" });
+  for (const denied of [thread({ cwd: "F:\\other" }), thread({ cwd: `${projectPath}\\child` }),
+    thread({ cwd: null }), thread({ cwd: "relative" }), thread({ id: "different" }), thread({ name: "[飞书] attached" }),
+    thread({ source: "subAgentReview" }), thread({ source: { subAgent: {} } }), thread({ parentThreadId: "parent" }), null]) {
+    metadata = denied;
+    await assert.rejects(f.reader.inspect({ projectPath: selected.cwd, threadId: selected.id }), /unavailable/);
+  }
+  assert.ok(f.connections.every(connection => connection.closed === 1));
+  assert.ok(f.requests.every(r => ["initialize", "thread/read"].includes(r.method)));
+  assert.equal(f.requests.filter(r => r.method === "thread/read").length, 11);
+});
+
+test("inspect requires the selected project path and thread id even if allProjects is supplied", async () => {
+  const f = fixture(() => assert.fail("unexpected history request"));
+  for (const input of [undefined, "", "relative", null]) {
+    await assert.rejects(f.reader.inspect({ projectPath: input, threadId: "thread-1", allProjects: true }), /absolute path/);
+  }
+  for (const threadId of [undefined, "", "  ", 42]) await assert.rejects(f.reader.inspect({ projectPath, threadId }), /threadId/);
+  assert.ok(f.requests.every(r => r.method === "initialize"));
+  assert.ok(f.connections.every(connection => connection.closed === 1));
+});
+
+test("inspect propagates metadata failures and closes the connection", async () => {
+  const failure = Object.assign(new Error("metadata failed"), { rpcCode: -32000 });
+  const f = fixture(() => { throw failure; });
+  await assert.rejects(f.reader.inspect({ projectPath, threadId: "thread-1" }), error => error === failure);
+  assert.equal(f.connections[0].closed, 1);
+  assert.equal(f.requests.length, 2);
+});
+
+test("inspect is deadline-bounded and closes stalled metadata reads", async () => {
+  const f = fixture(() => new Promise(() => {}), { timeoutMs: 25 });
+  await assert.rejects(f.reader.inspect({ projectPath, threadId: "thread-1" }), /timed out/);
+  assert.ok(f.connections.every(connection => connection.closed === 1));
+  assert.deepEqual(f.requests.map(r => r.method), ["initialize", "thread/read"]);
+});
+
+test("inspect shares the serial queue and closes before the next list starts", async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const f = fixture(async method => {
+    if (method === "thread/read") { await blocked; return { thread: thread() }; }
+    assert.equal(f.connections[0].closed, 1);
+    return { data: [] };
+  });
+  const inspection = f.reader.inspect({ projectPath, threadId: "thread-1" });
+  const listing = f.reader.list({ projectPath });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.connections.length, 1);
+  release();
+  await inspection;
+  await listing;
+  assert.equal(f.connections.length, 2);
+  assert.ok(f.connections.every(connection => connection.closed === 1));
 });

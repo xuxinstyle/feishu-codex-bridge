@@ -45,7 +45,8 @@ const createHistoryReader = options => actualCreateHistoryReader({ ...options, r
   writeFileSync(harnessPath, source.slice(0, boundary) + `\nexport function createHistoryHarness(messenger) {
     const runner = new TaskRunner(messenger); const allowedUserIds = new Set(["local-history-user"]); let pairingCode = null;
     ${showPanel}\n${handlers}
-    return { runner, handleMessage, handleCardAction, rpcMethods: historyRpcMethods };
+    return { runner, handleMessage, handleCardAction, rpcMethods: historyRpcMethods,
+      historySnapshots: () => getHistoryBrowser().snapshots };
   }\n`, "utf8");
   const { createHistoryHarness } = await import(pathToFileURL(harnessPath));
   let serial = 0;
@@ -90,6 +91,33 @@ const createHistoryReader = options => actualCreateHistoryReader({ ...options, r
   }
   await click(buttons(cards.at(-1).card).find(button => button.value.action === "show_history_refresh").value);
   evidence.refreshVerified = true;
+  await live.handleMessage({ ...actor, messageId: "local-history-all", text: "/threads all" });
+  const listState = () => live.historySnapshots().get(buttons(cards.at(-1).card).find(button => button.value.historyToken)?.value.historyToken);
+  const globalProjects = new Set();
+  let outside;
+  for (let page = 0; page < 10; page++) {
+    const snapshot = listState();
+    assert.equal(snapshot.allProjects, true);
+    for (const thread of snapshot.data.threads) globalProjects.add(thread.cwd.toLowerCase());
+    const candidate = snapshot.data.threads.find(thread => path.resolve(thread.cwd).toLowerCase() !== projectPath.toLowerCase());
+    if (candidate) outside = buttons(cards.at(-1).card).find(button => button.value.threadId === candidate.id);
+    if (outside && globalProjects.size >= 2) break;
+    const more = buttons(cards.at(-1).card).find(button => button.value.direction === "older");
+    if (!more) break;
+    await click(more.value);
+  }
+  assert.ok(outside && globalProjects.size >= 2, "Global verification requires saved conversations from at least two project directories");
+  await click(outside.value);
+  assert.equal(cards.at(-1).card.header.title.content, "聊天记录（只读）");
+  assert.notEqual(path.resolve(listState().threadProjectPath).toLowerCase(), projectPath.toLowerCase());
+  await click(buttons(cards.at(-1).card).find(button => button.value.action === "show_history_refresh").value);
+  await click(buttons(cards.at(-1).card).find(button => button.value.action === "show_history_list").value);
+  assert.equal(listState().allProjects, true);
+  await click(buttons(cards.at(-1).card).find(button => button.value.action === "show_history_scope").value);
+  assert.equal(listState().allProjects, false);
+  evidence.globalProjectCount = globalProjects.size;
+  evidence.crossProjectReadVerified = true;
+  evidence.globalScopeNavigationVerified = true;
   assert.equal(live.runner.tasks.size, 0);
   // Control-card message IDs are intentionally ephemeral; browsing must never
   // touch saved session mappings, settings or task queues.

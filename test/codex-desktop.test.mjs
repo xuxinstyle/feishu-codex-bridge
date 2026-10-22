@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { callDesktopTool, findDesktopPipe, runDesktopTask, steerDesktopTask } from "../codex-desktop.mjs";
+import { callDesktopTool, findDesktopPipe, prepareDesktopThread, runDesktopTask, steerDesktopTask } from "../codex-desktop.mjs";
 
 test("Desktop steering uses the existing writer and inherits the active turn settings", async () => {
   const calls = [];
@@ -35,13 +35,13 @@ test("Desktop delivery errors are ambiguous and must not trigger automatic retri
   }), error => error.steerOutcomeUnknown === true);
 });
 
-function fixture({ baselineStatus = "idle", baselineTurnStatus = "completed", baselineTurnId = "previous-turn", baselineReadError, finalStatus = "completed", prepareError } = {}) {
+function fixture({ cwd = "D:\\token_hub", baselineThreadId = "thread-a", baselineCwd = cwd, baselineStatus = "idle", baselineTurnStatus = "completed", baselineTurnId = "previous-turn", baselineReadError, finalStatus = "completed", prepareError } = {}) {
   const calls = [];
   let reads = 0;
   return {
     calls,
     options: {
-      pipePath: "fake-pipe", cwd: "D:\\token_hub", prompt: "用户消息", name: "[飞书] 测试",
+      pipePath: "fake-pipe", cwd, prompt: "用户消息", name: "[飞书] 测试",
       prepare: async () => { if (prepareError) throw prepareError; return "thread-a"; },
       startTurn: async (threadId, args) => {
         args.onSubmission?.("submitting");
@@ -57,7 +57,8 @@ function fixture({ baselineStatus = "idle", baselineTurnStatus = "completed", ba
         if (tool === "read_thread") {
           reads++;
           if (reads === 1 && baselineReadError) throw baselineReadError;
-          return { thread: { status: { type: reads === 1 ? baselineStatus : "idle" } }, turns: [{
+          return { thread: { id: reads === 1 ? baselineThreadId : "thread-a", cwd: reads === 1 ? baselineCwd : cwd,
+            status: { type: reads === 1 ? baselineStatus : "idle" } }, turns: [{
             id: reads === 1 ? baselineTurnId : "new-turn", status: reads === 1 ? baselineTurnStatus : finalStatus,
             error: finalStatus === "failed" ? { message: "provider failed" } : null,
             items: [{ type: "agentMessage", phase: "commentary", text: "处理中" }, { type: "agentMessage", phase: "final_answer", text: reads === 1 ? "上轮回复" : "本轮回复" }],
@@ -92,6 +93,182 @@ test("an active Desktop turn is never interrupted by a new Feishu message", asyn
   const f = fixture({ baselineStatus: "active" });
   await assert.rejects(runDesktopTask(f.options), /正在 Codex 客户端执行/);
   assert.ok(!f.calls.some(c => c.tool === "send_message_to_thread"));
+});
+
+test("explicit attachment prepares, sends and polls the original thread without changing its project or title", async () => {
+  // Exercise the real preparation function against a stdio RPC subprocess that
+  // rejects project operations, renaming and creation, even before Desktop calls.
+  const rpcServer = `
+    const readline = require("node:readline");
+    readline.createInterface({ input: process.stdin }).on("line", line => {
+      const request = JSON.parse(line);
+      if (request.id === undefined) return;
+      const allowed = request.method === "initialize" ||
+        request.method === "thread/read" && request.params.threadId === "thread-a";
+      process.stdout.write(JSON.stringify({ id: request.id, ...(allowed
+        ? { result: request.method === "initialize" ? {} : { thread: { id: "thread-a", cwd: ${JSON.stringify(process.cwd())}, status: { type: "idle" } } } }
+        : { error: { message: "Forbidden preparation operation: " + request.method } }) }) + "\\n");
+    });
+  `;
+  const f = fixture({ cwd: process.cwd() });
+  const prepared = [];
+  const bound = [];
+  const turns = [];
+  const result = await runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+    model: "", effort: "",
+    prepare: async args => {
+      prepared.push(args.threadId);
+      return prepareDesktopThread({ ...args, command: process.execPath, argsPrefix: ["-e", rpcServer, "--"] });
+    },
+    onThread: id => bound.push(id), onTurnStarted: turn => turns.push(turn),
+  });
+  assert.deepEqual(prepared, ["thread-a"]);
+  assert.deepEqual(bound, ["thread-a"]);
+  assert.deepEqual(turns, [{ threadId: "thread-a", turnId: "new-turn" }]);
+  assert.equal(result.threadId, "thread-a");
+  assert.equal(result.output, "本轮回复");
+  assert.deepEqual(f.calls.map(call => call.tool), ["read_thread", "send_message_to_thread", "read_thread"]);
+  assert.ok(f.calls.every(call => call.args.threadId === "thread-a"));
+  assert.deepEqual(f.calls[1].args, { threadId: "thread-a", hostId: "local", prompt: "用户消息" });
+});
+
+test("explicit attachment requires an existing id before preparing or calling Desktop", async () => {
+  for (const threadId of [undefined, null, ""]) {
+    const f = fixture();
+    let prepared = false;
+    await assert.rejects(runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId,
+      prepare: async () => { prepared = true; return "new-thread"; },
+    }), /附加已有会话必须提供 threadId/);
+    assert.equal(prepared, false);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test("explicit attachment rejects a replacement prepared thread before binding or sending", async () => {
+  const f = fixture();
+  let bound = false;
+  await assert.rejects(runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+    prepare: async () => "replacement-thread", onThread: () => { bound = true; },
+  }), /会话已有新内容/);
+  assert.equal(bound, false);
+  assert.deepEqual(f.calls, []);
+});
+
+test("explicit attachment refuses an active target without project changes or submission", async () => {
+  const f = fixture({ baselineStatus: "active" });
+  const prepared = [];
+  const submissions = [];
+  await assert.rejects(runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+    prepare: async args => { prepared.push(args.threadId); return args.threadId; },
+    onSubmission: state => submissions.push(state),
+  }), /正在 Codex 客户端执行/);
+  assert.deepEqual(prepared, ["thread-a"]);
+  assert.deepEqual(f.calls.map(call => call.tool), ["read_thread"]);
+  assert.deepEqual(submissions, []);
+});
+
+test("attachment accepts idle and notLoaded baselines with the same normalized directory", async () => {
+  for (const baselineStatus of ["idle", "notLoaded"]) {
+    const f = fixture({ baselineStatus, baselineCwd: "\\\\?\\D:\\TOKEN_HUB\\" });
+    const result = await runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a" });
+    assert.equal(result.threadId, "thread-a");
+    assert.equal(result.output, "本轮回复");
+    assert.deepEqual(f.calls.map(call => call.tool), ["read_thread", "send_message_to_thread", "read_thread"]);
+    assert.ok(f.calls.every(call => call.args.threadId === "thread-a"));
+  }
+});
+
+for (const { label, error, ...baseline } of [
+  { label: "changed thread id", baselineThreadId: "replacement-thread", error: /标识或目录已变化/ },
+  { label: "changed directory", baselineCwd: "D:\\token_hub-other", error: /标识或目录已变化/ },
+  { label: "missing thread id", baselineThreadId: null, error: /标识或目录已变化/ },
+  { label: "missing directory", baselineCwd: null, error: /absolute path/ },
+  { label: "relative directory", baselineCwd: "token_hub", error: /absolute path/ },
+  { label: "notLoaded with an inProgress turn", baselineStatus: "notLoaded", baselineTurnStatus: "inProgress", error: /正在 Codex 客户端执行/ },
+  { label: "idle with an inProgress turn", baselineStatus: "idle", baselineTurnStatus: "inProgress", error: /正在 Codex 客户端执行/ },
+  { label: "unknown runtime status", baselineStatus: "systemError", error: /状态尚未确认/ },
+  { label: "missing runtime status", baselineStatus: null, error: /状态尚未确认/ },
+]) {
+  test(`attachment rejects a baseline with ${label} without sending or writing`, async () => {
+    for (const continuation of [false, true]) {
+      const f = fixture({ ...(continuation ? { baselineTurnStatus: "interrupted" } : {}), ...baseline });
+      const prepared = [];
+      const submissions = [];
+      const controls = [];
+      await assert.rejects(runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+        ...(continuation ? { expectedTurnId: "previous-turn" } : {}),
+        prepare: async args => { prepared.push(args.threadId); return args.threadId; },
+        onSubmission: state => submissions.push(state), onControl: control => controls.push(control),
+      }), continuation && baseline.baselineTurnStatus === "inProgress" ? /会话已有新内容或原轮次未停止/ : error);
+      assert.deepEqual(prepared, ["thread-a"]);
+      assert.deepEqual(f.calls, [{ tool: "read_thread", args: { threadId: "thread-a", hostId: "local", turnLimit: 1 } }]);
+      assert.deepEqual(submissions, []);
+      assert.equal(controls.at(-1), null);
+    }
+  });
+}
+
+test("existing threads keep normal project placement behavior unless attachment preservation is requested", async () => {
+  const f = fixture();
+  await runDesktopTask({ ...f.options, threadId: "thread-a" });
+  assert.deepEqual(f.calls.map(call => call.tool), [
+    "list_projects", "read_thread", "send_message_to_thread", "move_thread_to_project", "read_thread",
+  ]);
+  assert.equal(f.calls.find(call => call.tool === "move_thread_to_project").args.projectId, "desktop-project");
+});
+
+test("attachment omits empty model and effort overrides for messages and native continuation", async () => {
+  for (const value of [undefined, null, ""]) {
+    for (const continuation of [false, true]) {
+      const f = fixture({ baselineTurnStatus: continuation ? "interrupted" : "completed" });
+      await runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+        model: value, effort: value, ...(continuation ? { expectedTurnId: "previous-turn" } : {}),
+      });
+      const send = f.calls.find(call => call.tool === (continuation ? "native:start" : "send_message_to_thread"));
+      assert.ok(send);
+      for (const key of ["model", "effort", "thinking"]) assert.equal(Object.hasOwn(send.args, key), false, key);
+      assert.ok(f.calls.every(call => call.args.threadId === "thread-a"));
+      assert.ok(!f.calls.some(call => /project|name/.test(call.tool)));
+    }
+  }
+});
+
+test("attachment failures propagate without retrying preparation or creating another thread", async () => {
+  for (const stage of ["prepare", "read_thread", "send_message_to_thread", "poll", "turn"]) {
+    const f = fixture({ finalStatus: stage === "turn" ? "failed" : "completed" });
+    const prepared = [];
+    let reads = 0;
+    const error = new Error(`attachment ${stage} failed`);
+    await assert.rejects(runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+      prepare: async args => { prepared.push(args.threadId); if (stage === "prepare") throw error; return args.threadId; },
+      callTool: async (...args) => {
+        const tool = args[2];
+        if (tool === "read_thread") reads++;
+        if (tool === stage || stage === "poll" && reads === 2) throw error;
+        return f.options.callTool(...args);
+      },
+    }), stage === "turn" ? /provider failed/ : candidate => candidate === error);
+    assert.deepEqual(prepared, ["thread-a"]);
+    assert.ok(f.calls.every(call => call.args.threadId === "thread-a"));
+    assert.ok(!f.calls.some(call => /project|name|start/.test(call.tool)));
+    assert.ok(f.calls.filter(call => call.tool === "send_message_to_thread").length <= 1);
+  }
+});
+
+test("attachment does not retry model reconnect rejection on the existing thread", async () => {
+  const f = fixture();
+  const error = JSON.stringify({ status: 400, error: { code: "model_change_requires_reconnect" } });
+  let reads = 0;
+  await assert.rejects(runDesktopTask({ ...f.options, preserveThreadPlacement: true, threadId: "thread-a",
+    callTool: async (...args) => {
+      const result = await f.options.callTool(...args);
+      if (args[2] === "read_thread" && ++reads === 2) {
+        result.turns[0] = { id: "new-turn", status: "failed", items: [], error: { message: error } };
+      }
+      return result;
+    },
+  }), candidate => candidate.message === error);
+  assert.deepEqual(f.calls.map(call => call.tool), ["read_thread", "send_message_to_thread", "read_thread"]);
 });
 
 test("a running Desktop task exposes steering and continues observing the same turn", async () => {

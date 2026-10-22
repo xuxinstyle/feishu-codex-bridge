@@ -1,8 +1,8 @@
 import path from "node:path";
 import { CodexAppServer, desktopCodexBinary } from "./codex-app-server.mjs";
 
-function projectPath(value) {
-  if (typeof value !== "string" || !value.trim()) throw new Error("projectPath must be an absolute path");
+export function historyProjectPath(value) {
+  if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error("projectPath must be an absolute path");
   const clean = value.trim().replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/, "");
   const windows = /^[a-z]:[\\/]|^\\\\/i.test(clean);
   const api = windows ? path.win32 : path.posix;
@@ -30,11 +30,22 @@ function subagent(source) {
 function visible(thread, project) {
   if (!thread || typeof thread.id !== "string" || !thread.id.trim() || rawTitle(thread).includes("[飞书]") ||
       thread.parentThreadId || subagent(thread.source) || subagent(thread.threadSource)) return false;
-  try { return projectPath(thread.cwd).key === project.key; } catch { return false; }
+  try {
+    const cwd = historyProjectPath(thread.cwd);
+    return !project || cwd.key === project.key;
+  } catch { return false; }
 }
 
 function status(thread) {
   return typeof thread.status === "string" ? thread.status : thread.status?.type || "unknown";
+}
+
+async function verifiedThread(request, project, threadId) {
+  if (typeof threadId !== "string" || !threadId.trim()) throw new Error("threadId is required");
+  const metadata = await request("thread/read", { threadId, includeTurns: false });
+  const thread = metadata?.thread;
+  if (thread?.id !== threadId || !visible(thread, project)) throw new Error("Thread is unavailable in this project history");
+  return thread;
 }
 
 function cursorValue(cursor) {
@@ -70,10 +81,16 @@ function messagesFromTurns(turns) {
 
 /**
  * Read local persisted Codex history, without binding or resuming a session.
- * Callers must authorize the viewer and project before calling either method.
+ * Callers must authorize the viewer and project before calling any method.
  * Text is not a secret-redaction boundary; tools, reasoning and attachments are
  * omitted, but user/assistant text and titles can still contain sensitive data.
- * nextCursor is opaque; an empty filtered list page can still have a next page.
+ * list({ allProjects: true }) omits projectPath filtering; returned cwd values
+ * must be bound to the selected thread by the caller. inspect and read always
+ * require that explicit projectPath and recheck freshly read metadata.
+ * inspect returns metadata only. Its standalone-server status (e.g. notLoaded)
+ * does not establish that the thread is idle in Desktop.
+ * List skips at most five filtered pages per operation. nextCursor is opaque;
+ * an empty result at that bound can still have a next page.
  */
 export function createHistoryReader({
   command = "codex", argsPrefix = [], shell = false, cwd = process.cwd(), env = process.env,
@@ -94,12 +111,12 @@ export function createHistoryReader({
       const rpc = rpcFactory(rpcOptions);
       let timer;
       let expired = false;
-      // Also bound initialization and the whole two-request read operation.
+      // One deadline covers initialization and every request in this operation.
       const deadline = new Promise((_, reject) => {
         timer = setTimeout(() => { expired = true; reject(new Error("Codex history operation timed out")); }, remainingMs);
       });
       const request = async (method, params) => {
-        if (expired) throw new Error("Codex history operation timed out");
+        if (expired || Date.now() >= deadlineAt) throw new Error("Codex history operation timed out");
         return rpc.request(method, params);
       };
       try {
@@ -118,32 +135,46 @@ export function createHistoryReader({
   }
 
   return {
-    list({ projectPath: input, cursor = null } = {}) {
+    list({ projectPath: input, cursor = null, allProjects = false } = {}) {
       return operation(async request => {
-        const project = projectPath(input);
+        if (typeof allProjects !== "boolean") throw new Error("allProjects must be a boolean");
+        const project = allProjects ? null : historyProjectPath(input);
         cursor = cursorValue(cursor);
-        const result = pageResult(await request("thread/list", {
-          cwd: project.path, cursor, limit: 20, archived: false,
-          sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true,
-          modelProviders: [], sourceKinds: ["cli", "vscode", "exec", "appServer"],
-        }), cursor);
-        return {
-          threads: result.data.filter(thread => visible(thread, project)).map(thread => ({
-            id: thread.id, title: title(thread), updatedAt: thread.updatedAt ?? null, status: status(thread),
-          })),
-          nextCursor: result.nextCursor,
-        };
+        const seen = new Set(cursor === null ? [] : [cursor]);
+        for (let page = 0; page < 5; page++) {
+          const result = pageResult(await request("thread/list", {
+            ...(project ? { cwd: project.path } : {}), cursor, limit: 20, archived: false,
+            sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true,
+            modelProviders: [], sourceKinds: ["cli", "vscode", "exec", "appServer"],
+          }), cursor);
+          if (result.nextCursor !== null) {
+            if (seen.has(result.nextCursor)) throw new Error("Codex history returned a repeated cursor cycle");
+            seen.add(result.nextCursor);
+          }
+          const threads = result.data.filter(thread => visible(thread, project)).map(thread => ({
+            id: thread.id, title: title(thread), cwd: historyProjectPath(thread.cwd).path,
+            updatedAt: thread.updatedAt ?? null, status: status(thread),
+          }));
+          if (threads.length || result.nextCursor === null || page === 4) {
+            return { threads, nextCursor: result.nextCursor };
+          }
+          cursor = result.nextCursor;
+        }
+      });
+    },
+
+    inspect({ projectPath: input, threadId } = {}) {
+      return operation(async request => {
+        const thread = await verifiedThread(request, historyProjectPath(input), threadId);
+        return { id: thread.id, title: title(thread), cwd: historyProjectPath(thread.cwd).path, status: status(thread) };
       });
     },
 
     read({ projectPath: input, threadId, cursor = null } = {}) {
       return operation(async request => {
-        const project = projectPath(input);
+        const project = historyProjectPath(input);
         cursor = cursorValue(cursor);
-        if (typeof threadId !== "string" || !threadId.trim()) throw new Error("threadId is required");
-        const metadata = await request("thread/read", { threadId, includeTurns: false });
-        const thread = metadata?.thread;
-        if (thread?.id !== threadId || !visible(thread, project)) throw new Error("Thread is unavailable in this project history");
+        const thread = await verifiedThread(request, project, threadId);
         let response;
         try {
           response = await request("thread/turns/list", { threadId, cursor, limit: 3, sortDirection: "desc", itemsView: "full" });

@@ -10,7 +10,9 @@ export function parseCommand(text) {
     return { type: "sessions" };
   }
   if (/^\/(?:threads|history)(?:\s|$)/i.test(trimmed) || ["本地会话", "聊天记录"].includes(trimmed)) {
-    return { type: "history", invalidArgs: /^\/(?:threads|history)\s+\S/i.test(trimmed) };
+    const argument = trimmed.match(/^\/(?:threads|history)\s+([\s\S]+)$/i)?.[1]?.trim() || "";
+    return { type: "history", allProjects: /^(all|全部|所有)$/i.test(argument),
+      invalidArgs: Boolean(argument) && !/^(all|全部|所有|current|当前)$/i.test(argument) };
   }
 
   const modelMatch = trimmed.match(/^\/(?:model|模型)(?:\s+(.+))?$/i);
