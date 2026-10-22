@@ -301,7 +301,7 @@ export function mergeProjectChoices(baseChoices = [], discoveredPaths = []) {
 }
 
 export function shouldRefreshProjectChoicesForCardAction(action) {
-  return action === "refresh" || action === "show_sessions";
+  return action === "refresh";
 }
 
 export function createKeyedSerialExecutor() {

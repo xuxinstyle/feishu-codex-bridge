@@ -344,6 +344,7 @@ async function refreshProjectChoices(reason = "manual") {
         config.bridge.manualProjectChoices,
         discoveredPaths
       );
+      refreshProjectChoices.lastError = "";
       log("info", "project choices refreshed from Codex thread history", {
         reason,
         discoveredCount: discoveredPaths.length,
@@ -351,6 +352,7 @@ async function refreshProjectChoices(reason = "manual") {
         durationMs: Date.now() - startedAt,
       });
     } catch (error) {
+      refreshProjectChoices.lastError = String(error);
       log("warn", "failed to refresh project choices from Codex thread history", {
         reason,
         error: String(error),
@@ -578,14 +580,19 @@ class FeishuMessenger {
   }
 
   async updateCard(messageId, card) {
-    const res = await this.client.im.message.patch({
-      path: { message_id: messageId },
-      data: {
-        content: JSON.stringify(card),
-      },
-    });
-    assertFeishuApiSuccess(res, "更新飞书卡片");
-    return res;
+    const startedAt = Date.now();
+    try {
+      const res = await this.client.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: JSON.stringify(card) },
+      });
+      assertFeishuApiSuccess(res, "更新飞书卡片");
+      log("info", "card patch completed", { messageId, patchMs: Date.now() - startedAt });
+      return res;
+    } catch (error) {
+      log("warn", "card patch failed", { messageId, patchMs: Date.now() - startedAt, error: String(error) });
+      throw error;
+    }
   }
 }
 
@@ -932,14 +939,28 @@ class TaskRunner {
     this.sessionResetAt.set(key, Date.now());
     this.sessionGenerations.set(key, (this.sessionGenerations.get(key) || 0) + 1);
     const existed = this.sessions.delete(key);
+    for (const task of this.tasks.values()) {
+      if (task.source.chatId === chatId && task.projectPath === projectPath && task.sessionName === normalized &&
+          task.status === "interrupted") this.releaseTaskImage(task);
+    }
     this.persistSessionState();
     return { sessionName: normalized, existed };
   }
 
   stopTask(taskId, scope) { return this.interruption.stop(taskId, scope); }
 
-  currentTask(chatId, projectPath) {
-    const name = this.activeSessionName(chatId, projectPath);
+  releaseTaskImage(task) {
+    const filePath = task.contextImagePath || task.imagePath;
+    if (!filePath || task.submissionUncertain || [...this.tasks.values()].some(other => other !== task &&
+      (["pending", "running", "stopping"].includes(other.status) || other.submissionUncertain) &&
+      (other.contextImagePath || other.imagePath) === filePath)) return;
+    rmSync(filePath, { force: true });
+    task.contextImagePath = null;
+    task.imagePath = null;
+  }
+
+  currentTask(chatId, projectPath, sessionName = this.activeSessionName(chatId, projectPath)) {
+    const name = sessionName;
     return [...this.tasks.values()].find(t => t.source.chatId === chatId && t.projectPath === projectPath && t.sessionName === name && ["running", "stopping"].includes(t.status) && this.steering.isCurrent(t));
   }
 
@@ -948,16 +969,31 @@ class TaskRunner {
     if (!task || task.source.chatId !== source.chatId || (task.source.senderId && task.source.senderId !== source.senderId) || task.status !== "interrupted") {
       throw new Error("这条任务没有处于已停止状态，或不属于当前聊天和用户。");
     }
+    // A fast stop can beat a steering receipt. Settle it before taking the
+    // continuation snapshot, so an acknowledged requirement cannot be omitted.
+    await Promise.allSettled([...(task.steeringOperations || [])]);
+    if (task.steeringUncertain) throw new Error("补充要求的提交结果尚未确认，请先在 Codex 客户端核对，避免重复提交。");
     if (!this.steering.isCurrent(task)) throw new Error("会话已经重置，旧任务卡片不能继续执行。");
-    if (this.currentTask(source.chatId, task.projectPath)) throw new Error("当前会话还有任务正在执行，请等待结束。");
+    if (this.currentTask(source.chatId, task.projectPath, task.sessionName)) throw new Error("当前会话还有任务正在执行，请等待结束。");
     if (task.resumedAs) throw new Error("这条任务已经继续，请查看新的任务卡片。");
+    const expectedTurnId = task.turnId || task.resumeTurnId;
+    const threadId = task.threadId || task.resumeThreadId;
+    if (expectedTurnId && !threadId) throw new Error("原任务会话未确认，无法安全继续，请在 Codex 客户端检查。");
+    if (!task.turnId && ["submitting", "submitted"].includes(task.submissionState)) {
+      throw new Error("原任务的提交结果尚未确认，不能重复发送，请在 Codex 客户端检查。");
+    }
     if (!task.resumeOperation) task.resumeOperation = this.create(source, task.projectPath,
-      `请继续刚才被停止的任务，先核对已经完成的进展，再接着完成。\n原任务：${task.prompt}`, task.sessionName, task.imageKey, {
-        threadId: task.threadId, model: task.model, reasoningOverride: task.reasoningOverride,
+      task.prompt, task.sessionName, task.imageKey, {
+        threadId, expectedTurnId, executionPrompt: expectedTurnId ? "继续" : task.executionPrompt || task.prompt,
+        resumeFromTaskId: task.taskId, rootTaskId: task.rootTaskId || task.taskId,
+        continuationInputs: [...(task.resumeSteeringInputs || []), ...(task.steeringInputs || [])],
+        expectedInitialInputKind: task.turnId ? task.initialInputKind : task.resumeInitialInputKind || task.initialInputKind,
+        model: task.model, reasoningOverride: task.reasoningOverride, effort: task.effort,
+        contextImagePath: task.contextImagePath,
         imageMessageId: task.imageMessageId || task.source.messageId,
       }).then(next => {
         task.resumedAs = next.taskId;
-        this.publishTaskText(task, "已开始继续任务，请查看新的任务卡片。").catch(() => {});
+        this.publishTaskText(task, "").catch(() => {});
         return next;
       });
     return task.resumeOperation;
@@ -1027,6 +1063,7 @@ class TaskRunner {
           name,
           status,
           taskId: activeTask?.taskId || "",
+          summary: compactText(activeTask?.prompt || session?.lastPrompt || "", 65),
           progress,
           turns: session?.turns || 0,
           updatedAt: session?.updatedAt || "",
@@ -1052,9 +1089,19 @@ class TaskRunner {
       projectPath,
       sessionName: normalizedSessionName,
       prompt,
+      // The user's objective belongs on cards; a control action is a separate
+      // minimal input to the existing conversation, never a rewritten task.
+      executionPrompt: resume?.executionPrompt ?? prompt,
+      resumeFromTaskId: resume?.resumeFromTaskId || null,
+      rootTaskId: resume?.rootTaskId || null,
       imageKey,
+      contextImagePath: resume?.contextImagePath || null,
       imageMessageId: resume?.imageMessageId || source.messageId,
       resumeThreadId: resume?.threadId || null,
+      resumeTurnId: resume?.expectedTurnId || null,
+      resumeSteeringInputs: resume?.continuationInputs || [],
+      resumeInitialInputKind: resume?.expectedInitialInputKind,
+      submissionState: "not-started",
       status: "pending",
       createdAt: Date.now(),
       startedAt: null,
@@ -1066,11 +1113,17 @@ class TaskRunner {
       progress: "",
       lastEventAt: null,
       modelOverride: this.modelOverride(source.chatId, projectPath),
-      reasoningOverride: resume?.reasoningOverride ?? this.reasoningOverride(source.chatId, projectPath),
+      reasoningOverride: resume ? resume.reasoningOverride : this.reasoningOverride(source.chatId, projectPath),
       model: resume?.model || this.effectiveModel(source.chatId, projectPath),
       steerTargetTaskId: steerTarget?.taskId,
       sessionGeneration: this.sessionGenerations.get(sessionKey(source.chatId, projectPath, normalizedSessionName)) || 0,
     };
+    task.initialInputKind = config.codex.transport === "desktop" && !task.resumeTurnId ? "functionCallOutput" : "userMessage";
+    task.effort = resume && resume.effort !== undefined ? resume.effort : effectiveReasoningEffort({
+      configuredEffort: config.codex.reasoningEffort,
+      defaultEffort: config.codex.defaultReasoningEffort,
+      scopedEffort: task.reasoningOverride,
+    });
     task.generation = task.taskId;
     this.tasks.set(task.taskId, task);
     try {
@@ -1092,7 +1145,7 @@ class TaskRunner {
     const overrides = [...config.codex.configOverrides];
     if (config.codex.profile) overrides.push(`profile=${JSON.stringify(config.codex.profile)}`);
     if (config.codex.enableWebSearch) overrides.push('web_search="live"');
-    const effort = effectiveReasoningEffort({
+    const effort = task.effort ?? effectiveReasoningEffort({
       configuredEffort: config.codex.reasoningEffort,
       defaultEffort: config.codex.defaultReasoningEffort,
       scopedEffort: task.reasoningOverride,
@@ -1124,6 +1177,7 @@ class TaskRunner {
     if (!this.steering.isCurrent(task)) {
       task.status = "cancelled";
       task.finishedAt = Date.now();
+      this.releaseTaskImage(task);
       await this.publishTaskText(task, "会话已重置，这条旧待办已取消。", { rotateOnAnyUpdateError: true }).catch(() => {});
       return;
     }
@@ -1169,7 +1223,10 @@ class TaskRunner {
         push(false).catch((error) => log("warn", "periodic push failed", { error: String(error) }));
       }, config.bridge.streamPushInterval);
 
-      if (task.imageKey) {
+      if (task.contextImagePath) {
+        if (!existsSync(task.contextImagePath)) throw new Error("原任务的图片文件已不可用，请重新发送图片。");
+        task.imagePath = task.contextImagePath;
+      } else if (task.imageKey) {
         imageDownloadPath = path.join(tmpdir(), `feishu-codex-${task.taskId}-image.download`);
         const downloaded = await this.messenger.downloadMessageResource(
           task.imageMessageId,
@@ -1209,24 +1266,24 @@ class TaskRunner {
         cwd: task.projectPath,
         env: { ...process.env, CODEX_HOME: codexHome },
         threadId,
+        expectedTurnId: task.resumeTurnId,
+        continuationInputs: task.resumeSteeringInputs,
+        expectedInitialInputKind: task.resumeInitialInputKind,
         model: task.model,
-        effort: effectiveReasoningEffort({
-          configuredEffort: config.codex.reasoningEffort,
-          defaultEffort: config.codex.defaultReasoningEffort,
-          scopedEffort: task.reasoningOverride,
-        }),
+        effort: task.effort,
         sandbox: config.codex.dangerousBypass ? "danger-full-access"
           : config.codex.fullAuto ? "workspace-write" : config.codex.sandboxMode,
         approvalPolicy: config.codex.dangerousBypass ? "never" : config.codex.approvalPolicy,
-        prompt: task.prompt,
-        imagePath: task.imagePath,
+        prompt: task.executionPrompt,
+        imagePath: task.resumeTurnId ? undefined : task.imagePath,
         name,
         timeoutMs: config.codex.taskTimeout,
         onControl: (control) => {
           if (control) this.activeTasks.set(task.taskId, control);
           else this.activeTasks.delete(task.taskId);
         },
-        onTurnStarted: ({ turnId }) => { task.turnId = turnId; },
+        onTurnStarted: ({ turnId }) => { task.turnId = turnId; task.resumeSteeringInputs = []; },
+        onSubmission: state => { task.submissionState = state; },
         onThread: (id) => {
           task.threadId = id;
           task.desktopName = name;
@@ -1240,6 +1297,7 @@ class TaskRunner {
         },
       });
       task.output = result.output || task.output;
+      if (result.turn?.id) task.turnId = result.turn.id;
       this.saveAppServerSession(task, result.threadId, { completed: Boolean(result.turn?.id) });
 
       if (task.status === "cancelled") return;
@@ -1249,6 +1307,7 @@ class TaskRunner {
     } catch (error) {
       if (task.status !== "cancelled") {
         task.status = "failed";
+        task.submissionUncertain = ["submitting", "submitted"].includes(task.submissionState);
         task.error = error instanceof Error ? error.message : String(error);
         if (!task.output) task.output = task.error;
       }
@@ -1263,6 +1322,16 @@ class TaskRunner {
         }
       }
       task.finishedAt = Date.now();
+      const retryableContinuationFailure = task.status === "failed" && task.resumeFromTaskId && task.submissionState === "not-started" && this.steering.isCurrent(task);
+      if (retryableContinuationFailure) {
+        const previous = this.tasks.get(task.resumeFromTaskId);
+        if (previous?.resumedAs === task.taskId) {
+          previous.resumedAs = null;
+          previous.resumeOperation = null;
+          await this.publishTaskText(previous, "暂未开始继续任务，可在问题解决后重试；原上下文已保留。").catch(() => {});
+        }
+      }
+      if (task.status === "interrupted" && this.steering.isCurrent(task) && task.imagePath) task.contextImagePath = task.imagePath;
       const generatedImages = this.generatedImagesForTask(task);
       let sentImageCount = 0;
       let imageDeliveryError = "";
@@ -1299,7 +1368,10 @@ class TaskRunner {
       try { await this.publishTaskText(task, finalText, { rotateOnAnyUpdateError: true }); }
       catch (error) { log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) }); }
       if (imageDownloadPath) rmSync(imageDownloadPath, { force: true });
-      if (task.imagePath) rmSync(task.imagePath, { force: true });
+      if (task.imagePath) {
+        if (task.submissionUncertain || task.status === "interrupted" && this.steering.isCurrent(task)) task.contextImagePath = task.imagePath;
+        else if (!retryableContinuationFailure) this.releaseTaskImage(task);
+      }
       log("info", "task finished", { taskId: task.taskId, status: task.status, seconds });
     }
   }
@@ -1427,20 +1499,10 @@ async function handleMessage(message) {
     return;
   }
   if (command.type === "panel") {
-    const cardMessageId = await showControlCard(message.chatId, message.messageId, "控制卡片已打开");
+    await showControlCard(message.chatId, message.messageId);
+    // Refresh the cache only. A late discovery must never redraw a page the
+    // user has already navigated away from.
     refreshProjectChoices("panel")
-      .then(async () => {
-        if (!cardMessageId || runner.controlCardMessageId(message.chatId) !== cardMessageId) return;
-        await messenger.updateCard(
-          cardMessageId,
-          buildControlCard(
-            runner,
-            message.chatId,
-            runner.activeProjectPath(message.chatId),
-            "项目列表已刷新"
-          )
-        );
-      })
       .catch((error) => log("warn", "background panel project refresh failed", { error: String(error) }));
     return;
   }
@@ -1600,6 +1662,7 @@ async function handleMessage(message) {
         catch (error) { log("warn", "failed to update steering receipt", { error: String(error) }); }
       }
     } catch (error) {
+      log("warn", "steering delivery failed", { error: String(error), outcomeUnknown: Boolean(error.steerOutcomeUnknown) });
       notice = error.steerOutcomeUnknown
         ? (command.taskId ? "引导回执未确认，请到 Codex 客户端核对；为避免重复执行，这条排队消息已暂停。"
           : "引导回执未确认，请到 Codex 客户端核对；未自动重发，请核对后再决定是否补发。")
@@ -1642,19 +1705,74 @@ async function handleMessage(message) {
 }
 
 const executeCardActionSerially = createKeyedSerialExecutor();
+const cardActionDeduper = createMessageDeduper();
+const controlCardRevisions = new Map();
+const controlCardRenders = new Map();
 
 async function handleCardAction(raw) {
-  const event = normalizeCardAction(raw, { includeRaw: true });
+  const receivedAt = Date.now();
+  const event = normalizeCardAction(raw?.event || raw, { includeRaw: true });
+  const toast = (content, type = "info") => ({ toast: { type, content } });
   if (!event) {
     log("warn", "ignored unrecognized card action", {
       keys: raw && typeof raw === "object" ? Object.keys(raw) : [],
     });
-    return;
+    return toast("无法识别这张卡片，请发送 /panel 重新打开。", "error");
   }
-  return executeCardActionSerially(event.messageId, () => handleNormalizedCardAction(event));
+  const value = parseCardActionValue(event.action?.value);
+  if (allowedUserIds.size > 0 && !allowedUserIds.has(event.operator.openId)) return toast("你没有操作权限。", "error");
+  if (value?.bridge !== CARD_BRIDGE_ID || (value.scopeChatId && value.scopeChatId !== event.chatId)) return toast("卡片不属于当前聊天，请发送 /panel。", "error");
+  const eventId = raw?.header?.event_id || raw?.event_id || raw?.event?.event_id;
+  if (!cardActionDeduper.claim(eventId)) return toast("这次操作已收到，请勿重复提交。");
+  const isTaskAction = ["steer_task", "stop_task", "cancel_task", "resume_task"].includes(value.action) || value.action === "show_queue" && value.taskId;
+  if (isTaskAction) {
+    const task = runner.tasks.get(value.taskId);
+    const ownCard = task?.statusMessageId === event.messageId || value.action === "steer_task" && task?.steerCardMessageId === event.messageId;
+    const panel = runner.controlCardMessageId(event.chatId) === event.messageId;
+    if (!task || task.source.chatId !== event.chatId || task.source.senderId !== event.operator.openId || (!ownCard && !panel) || value.generation !== undefined && value.generation !== task.generation) {
+      return toast("任务卡片已失效，请发送 /panel 查看当前状态。", "warning");
+    }
+  } else if (!value.action?.startsWith("show_") && isStaleControlCardAction({ currentMessageId: runner.controlCardMessageId(event.chatId), actionMessageId: event.messageId })) {
+    return toast("这张面板已过期，请先点击返回首页或发送 /panel。", "warning");
+  }
+  event.panelRevision = (controlCardRevisions.get(event.messageId) || 0) + 1;
+  controlCardRevisions.set(event.messageId, event.panelRevision);
+  if (controlCardRevisions.size > 512) {
+    const oldest = controlCardRevisions.keys().next().value;
+    controlCardRevisions.delete(oldest);
+    controlCardRenders.delete(oldest);
+  }
+  const metadata = { action: value.action, messageId: event.messageId, revision: event.panelRevision };
+  log("info", "card action received", metadata);
+  const onError = async error => {
+    log("error", "card action handler failed", { ...metadata, durationMs: Date.now() - receivedAt, error: String(error) });
+    try { await messenger.replyText(event.messageId, "操作未完成，请发送 /panel 重试。若已点击停止，请在任务卡或 Codex 客户端核对状态。"); }
+    catch (deliveryError) { log("warn", "card action error delivery failed", { error: String(deliveryError) }); }
+  };
+  const background = ["steer_task", "stop_task", "cancel_task", "resume_task", "refresh"].includes(value.action) || value.action === "show_queue" && value.taskId;
+  if (background) {
+    const queuedAt = Date.now();
+    // Task controls use a separate queue so a slow network update cannot block
+    // cached navigation or the ACK that releases Feishu's loading indicator.
+    void executeCardActionSerially(`${event.messageId}:${value.action === "refresh" ? "refresh" : "task"}`, async () => {
+      log("info", "card action started", { ...metadata, queueWaitMs: Date.now() - queuedAt });
+      await handleNormalizedCardAction(event);
+      log("info", "card action completed", { ...metadata, durationMs: Date.now() - receivedAt });
+    }).catch(onError);
+    log("info", "card action acknowledged", { ...metadata, ackMs: Date.now() - receivedAt, delivery: "background" });
+    return toast(value.action === "refresh" ? "正在刷新项目列表…" : "正在处理…");
+  }
+  try {
+    const result = await handleNormalizedCardAction(event, { respondWithCard: true });
+    log("info", "card action acknowledged", { ...metadata, ackMs: Date.now() - receivedAt, delivery: result?.card ? "callback-card" : "toast" });
+    return result || toast("卡片已失效，请发送 /panel 重新打开。", "warning");
+  } catch (error) {
+    log("error", "card action handler failed", { ...metadata, error: String(error) });
+    return toast("操作失败，请发送 /panel 重试。", "error");
+  }
 }
 
-async function handleNormalizedCardAction(event) {
+async function handleNormalizedCardAction(event, { respondWithCard = false } = {}) {
   if (allowedUserIds.size > 0 && !allowedUserIds.has(event.operator.openId)) {
     log("warn", "ignored unauthorized card action", { senderId: event.operator.openId });
     return;
@@ -1668,6 +1786,25 @@ async function handleNormalizedCardAction(event) {
   const actionChatId = typeof value.scopeChatId === "string" && value.scopeChatId
     ? value.scopeChatId
     : event.chatId;
+  if (event.chatId && actionChatId !== event.chatId) return;
+  const deliverControlCard = async card => {
+    if (event.panelRevision && controlCardRevisions.get(event.messageId) !== event.panelRevision) return;
+    if (event.panelRevision) controlCardRenders.set(event.messageId, { revision: event.panelRevision, card });
+    if (respondWithCard) return { card: { type: "raw", data: card } };
+    if (runner.controlCardMessageId(actionChatId) !== event.messageId) return;
+    if (!event.panelRevision) return messenger.updateCard(event.messageId, card);
+    return executeCardActionSerially(`${event.messageId}:patch`, async () => {
+      let render = controlCardRenders.get(event.messageId);
+      while (render && runner.controlCardMessageId(actionChatId) === event.messageId) {
+        await messenger.updateCard(event.messageId, render.card);
+        const latest = controlCardRenders.get(event.messageId);
+        if (!latest || latest.revision === render.revision) break;
+        // An HTTP request already in flight cannot be cancelled reliably. If
+        // navigation returned a newer callback card meanwhile, restore it last.
+        render = latest;
+      }
+    });
+  };
   const cardProjectPath =
     typeof value.projectPath === "string" && value.projectPath
       ? resolveProjectPath(value.projectPath, config.bridge.defaultProjectPath)
@@ -1689,6 +1826,7 @@ async function handleNormalizedCardAction(event) {
       try { await runner.publishTaskText(task, notice); }
       catch (error) { log("warn", "failed to update steering receipt", { error: String(error) }); }
     } catch (error) {
+      log("warn", "card steering delivery failed", { taskId: value.taskId, error: String(error), outcomeUnknown: Boolean(error.steerOutcomeUnknown) });
       notice = error.steerOutcomeUnknown
         ? "引导回执未确认，请到 Codex 客户端核对；为避免重复执行，这条排队消息已暂停。"
         : `引导未提交：${error.message}`;
@@ -1712,7 +1850,7 @@ async function handleNormalizedCardAction(event) {
       } else notice = runner.stopTask(task.taskId, { chatId: actionChatId, senderId: event.operator.openId,
         generation: value.generation, messageId: ownTaskCard ? event.messageId : undefined }).notice;
     } catch (error) { notice = error.message; }
-    if (currentPanel) await messenger.updateCard(event.messageId, buildControlCard(runner, actionChatId, cardProjectPath, notice,
+    if (currentPanel) await deliverControlCard(buildControlCard(runner, actionChatId, cardProjectPath, notice,
       value.view === "queue" ? "queue" : "home", value.page, value.sessionName));
     else if (notice && task.source.chatId === actionChatId && task.source.senderId === event.operator.openId) await runner.publishTaskText(task, notice);
     return;
@@ -1730,36 +1868,41 @@ async function handleNormalizedCardAction(event) {
       actionMessageId: event.messageId,
     })
   ) {
-    log("warn", "ignored action from stale control card", {
+    // Read-only navigation may reclaim a historic panel. Mutating an old
+    // selection must ask the user to review the refreshed current state first.
+    if (!value.action?.startsWith("show_")) return { toast: { type: "warning", content: "这张面板已过期，请先点击返回首页或发送 /panel。" } };
+    log("info", "reactivated historical control card", {
       action: value.action,
       actionMessageId: event.messageId,
       currentCardMessageId,
       chatId: actionChatId,
     });
-    return;
+    runner.setControlCardMessageId(actionChatId, event.messageId);
   }
   if (!currentCardMessageId) {
     runner.setControlCardMessageId(actionChatId, event.messageId);
   }
   if (shouldRefreshProjectChoicesForCardAction(value.action)) {
     await refreshProjectChoices(`card:${value.action}`);
+    if (event.panelRevision && controlCardRevisions.get(event.messageId) !== event.panelRevision) return;
   }
-  const projectPath = value.view === "queue" ? cardProjectPath : cardProjectPathForAction({
+  const queueScoped = value.view === "queue" && ["show_queue", "resume_queue"].includes(value.action);
+  const projectPath = queueScoped ? cardProjectPath : cardProjectPathForAction({
     activeProjectPath: runner.activeProjectPath(actionChatId),
     cardProjectPath,
     defaultProjectPath: config.bridge.defaultProjectPath,
   });
   const controlSession = value.sessionName || runner.activeSessionName(actionChatId, projectPath);
-  let view = ["home", "projects", "sessions", "settings", "models", "reasoning", "queue"].includes(value.view) ? value.view : "home";
+  let view = ["home", "projects", "sessions", "settings", "models", "reasoning", "queue", "help"].includes(value.view) ? value.view : "home";
   let notice = "";
-  if (["show_home", "show_projects", "show_sessions", "show_settings", "show_models", "show_reasoning", "show_queue"].includes(value.action)) {
+  if (["show_home", "show_projects", "show_sessions", "show_settings", "show_models", "show_reasoning", "show_queue", "show_help"].includes(value.action)) {
     view = value.action.slice(5);
   } else if (value.action === "resume_queue") {
     runner.queue.resume(sessionKey(actionChatId, projectPath, controlSession));
     view = "queue";
     notice = "待办将按顺序执行。";
   } else if (value.action === "refresh") {
-    notice = "已刷新";
+    notice = refreshProjectChoices.lastError ? "刷新未完成，显示上次列表；可稍后重试。" : "项目列表已刷新";
   } else if (value.action === "reset_settings") {
     runner.clearModelOverride(actionChatId, projectPath);
     runner.clearReasoningOverride(actionChatId, projectPath);
@@ -1771,8 +1914,7 @@ async function handleNormalizedCardAction(event) {
     if (resolved.ok) {
       runner.setActiveProject(actionChatId, resolved.path);
       notice = `已切换项目为 ${resolved.alias}`;
-      await messenger.updateCard(event.messageId, buildControlCard(runner, actionChatId, resolved.path, notice));
-      return;
+      return deliverControlCard(buildControlCard(runner, actionChatId, resolved.path, notice));
     }
     notice = `项目无效: ${resolved.reason}`;
   } else if (value.action === "set_model") {
@@ -1822,7 +1964,7 @@ async function handleNormalizedCardAction(event) {
     notice = `未知动作: ${value.action}`;
   }
 
-  await messenger.updateCard(event.messageId, buildControlCard(runner, actionChatId, projectPath, notice, view, value.page,
+  return deliverControlCard(buildControlCard(runner, actionChatId, projectPath, notice, view, view === value.view ? value.page : 0,
     view === "queue" ? controlSession : null));
 }
 
@@ -1855,18 +1997,7 @@ const dispatcher = new EventDispatcher({}).register({
       }
     }
   },
-  "card.action.trigger": async (data) => {
-    log("info", "card action received", {
-      keys: data && typeof data === "object" ? Object.keys(data) : [],
-      eventKeys: data?.event && typeof data.event === "object" ? Object.keys(data.event) : [],
-    });
-    const raw = data?.event ? data.event : data;
-    try {
-      await handleCardAction(raw);
-    } catch (error) {
-      log("error", "card action handler failed", { error: String(error) });
-    }
-  },
+  "card.action.trigger": data => handleCardAction(data),
 });
 
 const wsClient = new WSClient({
@@ -1883,7 +2014,9 @@ log("info", "starting Feishu Codex bridge", {
   codexCommand: codexLauncher.command,
   sessionBackend: APP_SERVER_SESSION_BACKEND,
   taskTransport: config.codex.transport,
-  cardLayout: "compact-v1",
+  cardLayout: "compact-v2",
+  cardCallbacks: "immediate-v2",
+  cardRedraw: "revision-v1",
   taskControl: "interrupt-v1",
 });
 await wsClient.start({ eventDispatcher: dispatcher });

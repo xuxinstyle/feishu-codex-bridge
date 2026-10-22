@@ -2,8 +2,9 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { CodexAppServer, matchingProjectId, resolveAppServerProjectId } from "./codex-app-server.mjs";
-import { interruptDesktopTurn } from "./codex-desktop-ipc.mjs";
+import { interruptDesktopTurn, startDesktopTurn, steerDesktopTurn } from "./codex-desktop-ipc.mjs";
 import { TurnInterrupt } from "./turn-interrupt.mjs";
+import { missingSteeringInputs } from "./steering-context.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
@@ -68,19 +69,17 @@ export async function callDesktopTool(pipePath, callerThreadId, tool, args, time
   try { return JSON.parse(text); } catch { throw new Error(`Codex Desktop ${tool} returned invalid JSON: ${text.slice(0, 300)}`); }
 }
 
-export async function steerDesktopTask({ pipePath, threadId, turnId, prompt, callTool = callDesktopTool }) {
+export async function steerDesktopTask({ pipePath, threadId, turnId, prompt, callTool = callDesktopTool, steerTurn = steerDesktopTurn }) {
   if (!prompt?.trim()) throw new Error("补充要求不能为空。");
   const history = await callTool(pipePath, threadId, "read_thread", { threadId, hostId: "local", turnLimit: 1 });
   const active = history.turns?.[0];
   if (!turnId || active?.id !== turnId || active.status !== "inProgress") {
     throw new Error("原任务轮次已结束或已切换，无法引导；消息仍留在队列。");
   }
-  // Desktop's sendFollowUpMessage routes active work through its turn coordinator
-  // (steer/user-message admission). Never open a second app-server history writer.
-  // Omit model/thinking: steering inherits the running turn's settings.
+  // Save a real user message through the owner before confirming steering.
+  // Delegated tool output can remain queued and disappear when stopped.
   try {
-    await callTool(pipePath, threadId, "send_message_to_thread", { threadId, hostId: "local", prompt });
-    return { turnId };
+    return await steerTurn(threadId, turnId, { prompt, ...(history.thread?.cwd ? { cwd: history.thread.cwd } : {}) });
   } catch (error) {
     error.steerOutcomeUnknown = true;
     throw error;
@@ -116,18 +115,24 @@ export async function prepareDesktopThread({ command, argsPrefix, configArgs, cw
 }
 
 export async function runDesktopTask({
-  prompt, imagePath, model, effort, cwd, threadId: existingId, timeoutMs = 1_200_000,
+  prompt, imagePath, model, effort, cwd, threadId: existingId, expectedTurnId, continuationInputs = [], expectedInitialInputKind, timeoutMs = 1_200_000,
   onThread = () => {}, onTurnStarted = () => {}, onControl = () => {}, onOutput = () => {}, onProgress = () => {},
+  onSubmission = () => {},
   interruptTurn = interruptDesktopTurn,
+  startTurn = startDesktopTurn, steerTurn = steerDesktopTurn,
   pollIntervalMs = 1500,
   pipePath = findDesktopPipe(), prepare = prepareDesktopThread, callTool = callDesktopTool, ...options
 }) {
+  const resumeConflict = () => new Error("会话已有新内容或原轮次未停止，请从当前会话继续。");
+  if (expectedTurnId && !existingId) throw resumeConflict();
+  if (continuationInputs.length && !expectedTurnId) throw resumeConflict();
   if (!pipePath) throw new Error("未检测到 Codex 客户端，请先打开客户端，再从飞书发送消息。");
   let finished = false;
-  const interruption = new TurnInterrupt(interruptTurn);
+  let interruption = new TurnInterrupt(interruptTurn);
   onControl({ canCancel: true, interrupt: () => interruption.request() });
   try {
     const threadId = await prepare({ ...options, cwd, threadId: existingId, model });
+    if (expectedTurnId && threadId !== existingId) throw resumeConflict();
     await onThread(threadId);
     const call = (tool, args, waitMs = 60_000) => callTool(pipePath, threadId, tool, args, waitMs);
     // Use Desktop's own project operation as well as server metadata: it updates
@@ -137,20 +142,34 @@ export async function runDesktopTask({
       .map(p => ({ id: p.projectId, roots: [{ path: p.path }] })), cwd);
 
     let baseline;
-    try { baseline = await call("read_thread", { threadId, hostId: "local", turnLimit: 1 }); }
-    catch (error) { if (existingId) throw error; baseline = {}; }
+    try { baseline = await call("read_thread", { threadId, hostId: "local", turnLimit: 1, ...(continuationInputs.length ? { maxOutputCharsPerItem: 20_000 } : {}) }); }
+    catch (error) { if (expectedTurnId) throw resumeConflict(); if (existingId) throw error; baseline = {}; }
+    if (expectedTurnId && (baseline?.turns?.[0]?.id !== expectedTurnId || baseline.turns[0].status !== "interrupted" || baseline.thread?.status?.type === "active")) throw resumeConflict();
     if (baseline.thread?.status?.type === "active") throw new Error("这条会话正在 Codex 客户端执行任务，请等待完成后再从飞书发送消息。");
     const previousTurnId = baseline.turns?.[0]?.id;
+    const textInputs = expectedTurnId ? missingSteeringInputs(baseline.turns[0], continuationInputs, expectedInitialInputKind).map(item => item.prompt) : [];
     const desktopPrompt = imagePath ? `${prompt}\n\n用户上传的图片保存在本机：${JSON.stringify(imagePath)}。请先使用图片查看工具读取这张图片。` : prompt;
     if (!interruption.beginSubmission()) return { threadId, turn: { status: "interrupted" }, output: "任务在提交前已停止。" };
-    await call("send_message_to_thread", { threadId, hostId: "local", prompt: desktopPrompt,
-      ...(model ? { model } : {}), ...(effort ? { thinking: effort } : {}) });
+    let activeTurnId;
+    if (expectedTurnId) {
+      const admitted = await startTurn(threadId, { prompt, textInputs, imagePath, model, effort, onSubmission });
+      if (!admitted.turn?.id || admitted.turn.id === expectedTurnId || admitted.admissionOutcome && admitted.admissionOutcome !== "started") {
+        throw Object.assign(new Error("客户端未确认独立续作轮次，请在客户端核对，避免重复提交。"), { submissionOutcomeUnknown: true });
+      }
+      activeTurnId = admitted.turn.id;
+      onTurnStarted({ threadId, turnId: activeTurnId });
+      interruption.observe(threadId, activeTurnId);
+    } else {
+      onSubmission("submitting");
+      await call("send_message_to_thread", { threadId, hostId: "local", prompt: desktopPrompt,
+        ...(model ? { model } : {}), ...(effort ? { thinking: effort } : {}) });
+      onSubmission("submitted");
+    }
     if (projectId) await call("move_thread_to_project", { threadId, hostId: "local", projectId });
     onProgress("Codex 客户端已开始处理任务。");
-    let activeTurnId;
     onControl({ canCancel: true, interrupt: () => interruption.request(), steer: prompt => {
       if (finished) throw new Error("当前轮次已结束，无法引导。");
-      return steerDesktopTask({ pipePath, threadId, turnId: activeTurnId, prompt, callTool });
+      return steerDesktopTask({ pipePath, threadId, turnId: activeTurnId, prompt, callTool, steerTurn });
     } });
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {

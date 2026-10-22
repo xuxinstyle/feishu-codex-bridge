@@ -32,7 +32,7 @@ export class TaskSteering {
   }
 
   submit(target, prompt) {
-    return this.serialize(target?.taskId, async () => {
+    const operation = this.serialize(target?.taskId, async () => {
       if (!prompt?.trim()) throw new Error("请输入补充要求，例如 /steer 请先完成测试。");
       if (!target || target.status !== "running" || !this.isCurrent(target)) {
         throw new Error("当前没有可引导的运行中任务；请先发送任务，或等待任务开始。");
@@ -41,8 +41,19 @@ export class TaskSteering {
       if (!control?.steer) throw new Error("任务尚未就绪，或执行端不支持引导；请稍后重试。");
       const result = await control.steer(prompt);
       target.steerCount = (target.steerCount || 0) + 1;
+      target.steeringInputs ||= [];
+      target.steeringInputs.push({ id: result?.clientUserMessageId || `${target.taskId}:steer:${target.steerCount}`, prompt });
       return { targetTaskId: target.taskId, ...result };
+    }).catch(error => {
+      if (target && error.steerOutcomeUnknown) target.steeringUncertain = true;
+      throw error;
     });
+    if (target) {
+      target.steeringOperations ||= new Set();
+      target.steeringOperations.add(operation);
+      void operation.finally(() => target.steeringOperations.delete(operation)).catch(() => {});
+    }
+    return operation;
   }
 
   promote(taskId, { chatId, senderId, messageId }) {

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { TurnInterrupt } from "./turn-interrupt.mjs";
+import { missingSteeringInputs } from "./steering-context.mjs";
 
 export const APP_SERVER_SESSION_BACKEND = "app-server-v1";
 
@@ -156,15 +157,26 @@ export class CodexAppServer extends EventEmitter {
 
 export async function runAppServerTask({
   command, argsPrefix, configArgs, cwd, env, shell, spawnImpl,
-  threadId: resumeId = null, model = "", effort = "", sandbox = "workspace-write", approvalPolicy = "never",
+  threadId: resumeId = null, expectedTurnId, continuationInputs = [], expectedInitialInputKind, model = "", effort = "", sandbox = "workspace-write", approvalPolicy = "never",
   prompt, imagePath = "", name, timeoutMs = 1_200_000,
   onControl = () => {}, onThread = () => {}, onTurnStarted = () => {}, onOutput = () => {}, onProgress = () => {}, onDiagnostic = () => {},
+  onSubmission = () => {},
 }) {
+  const resumeConflict = () => new Error("会话已有新内容或原轮次未停止，请从当前会话继续。");
+  if (expectedTurnId && !resumeId) throw resumeConflict();
+  if (continuationInputs.length && !expectedTurnId) throw resumeConflict();
   const rpc = new CodexAppServer({ command, argsPrefix, configArgs, cwd, env, shell, spawnImpl });
   let threadId = resumeId;
   let turnId;
   let settled = false;
   let stopping = false;
+  let submitting = false;
+  let submitted = false;
+  const confirmSubmission = () => {
+    if (!submitting || submitted) return;
+    submitted = true;
+    onSubmission("submitted");
+  };
   let resolveDone;
   let rejectDone;
   const messages = new Map();
@@ -225,7 +237,7 @@ export async function runAppServerTask({
     if (params.threadId !== threadId || settled) return;
     if (method === "turn/started") {
       turnId ||= params.turn?.id;
-      if (turnId) { onTurnStarted({ threadId, turnId }); interruption.observe(threadId, turnId); }
+      if (turnId) { confirmSubmission(); onTurnStarted({ threadId, turnId }); interruption.observe(threadId, turnId); }
       onProgress("Codex 已开始处理任务。");
     }
     if (turnId && params.turnId && params.turnId !== turnId) return;
@@ -252,7 +264,9 @@ export async function runAppServerTask({
     let result;
     if (threadId) {
       result = await rpc.request("thread/resume", { ...params, threadId, excludeTurns: true });
+      if (expectedTurnId && result?.thread?.id !== resumeId) throw resumeConflict();
       if (result.thread?.status?.type === "active") {
+        if (expectedTurnId) throw resumeConflict();
         throw new Error("这条会话正在 Codex 客户端执行任务，请等待完成后再从飞书发送消息。");
       }
       // Repair sessions created before explicit Desktop project membership was
@@ -273,9 +287,20 @@ export async function runAppServerTask({
     if (!resumeId && name) await rpc.request("thread/name/set", { threadId, name });
     const input = [{ type: "text", text: prompt, text_elements: [] }];
     if (imagePath) input.push({ type: "localImage", path: imagePath });
+    if (expectedTurnId) {
+      let history;
+      try { history = await rpc.request("thread/read", { threadId, includeTurns: true }); }
+      catch { throw resumeConflict(); }
+      const latest = history?.thread?.turns?.at(-1);
+      if (latest?.id !== expectedTurnId || latest.status !== "interrupted" || history.thread?.status?.type === "active") throw resumeConflict();
+      input.unshift(...missingSteeringInputs(latest, continuationInputs, expectedInitialInputKind).map(item => ({ type: "text", text: item.prompt, text_elements: [] })));
+    }
     if (!interruption.beginSubmission()) return { threadId, turn: { status: "interrupted" }, output: "任务在提交前已停止。" };
+    submitting = true;
+    onSubmission("submitting");
     const started = await rpc.request("turn/start", { threadId, input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
     turnId = started.turn.id;
+    confirmSubmission();
     onTurnStarted({ threadId, turnId });
     interruption.observe(threadId, turnId);
     if (completedTurns.has(turnId)) complete(completedTurns.get(turnId));
