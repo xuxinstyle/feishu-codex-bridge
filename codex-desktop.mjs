@@ -1,4 +1,5 @@
 import net from "node:net";
+import { isModelReconnectRejection } from "./model-reconnect.mjs";
 import { randomUUID } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { CodexAppServer, matchingProjectId, resolveAppServerProjectId } from "./codex-app-server.mjs";
@@ -124,7 +125,7 @@ export async function runDesktopTask({
 }) {
   if (!pipePath) throw new Error("未检测到 Codex 客户端，请先打开客户端，再从飞书发送消息。");
   let finished = false;
-  const interruption = new TurnInterrupt(interruptTurn);
+  let interruption = new TurnInterrupt(interruptTurn);
   onControl({ canCancel: true, interrupt: () => interruption.request() });
   try {
     const threadId = await prepare({ ...options, cwd, threadId: existingId, model });
@@ -140,7 +141,7 @@ export async function runDesktopTask({
     try { baseline = await call("read_thread", { threadId, hostId: "local", turnLimit: 1 }); }
     catch (error) { if (existingId) throw error; baseline = {}; }
     if (baseline.thread?.status?.type === "active") throw new Error("这条会话正在 Codex 客户端执行任务，请等待完成后再从飞书发送消息。");
-    const previousTurnId = baseline.turns?.[0]?.id;
+    let previousTurnId = baseline.turns?.[0]?.id;
     const desktopPrompt = imagePath ? `${prompt}\n\n用户上传的图片保存在本机：${JSON.stringify(imagePath)}。请先使用图片查看工具读取这张图片。` : prompt;
     if (!interruption.beginSubmission()) return { threadId, turn: { status: "interrupted" }, output: "任务在提交前已停止。" };
     await call("send_message_to_thread", { threadId, hostId: "local", prompt: desktopPrompt,
@@ -153,6 +154,7 @@ export async function runDesktopTask({
       return steerDesktopTask({ pipePath, threadId, turnId: activeTurnId, prompt, callTool });
     } });
     const deadline = Date.now() + timeoutMs;
+    let modelReconnectRetried = false;
     while (Date.now() < deadline) {
       // wait_threads cannot wait on its own calling thread. The Desktop read
       // operation is read-only and does not acquire a second history writer.
@@ -169,6 +171,25 @@ export async function runDesktopTask({
       const output = (final.length ? final : messages).map(i => i.text).join("\n\n");
       if (output) onOutput(output);
       if (["completed", "interrupted"].includes(turn.status)) return { threadId, turn, output };
+      if (!existingId && !modelReconnectRetried && !interruption.requested && isModelReconnectRejection(turn)) {
+        const latest = await call("read_thread", { threadId, hostId: "local", turnLimit: 1 });
+        if (latest.turns?.[0]?.id !== turn.id || latest.thread?.status?.type === "active") {
+          throw new Error("模型重连前会话已变化，请在客户端查看当前任务。");
+        }
+        if (interruption.requested) return { threadId, turn: { ...turn, status: "interrupted" }, output: "任务已停止。" };
+        // The rejected request did no model work. The engine discarded that
+        // connection; retry once on its new connection using the same owner.
+        modelReconnectRetried = true;
+        interruption.finish();
+        interruption = new TurnInterrupt(interruptTurn);
+        interruption.beginSubmission();
+        previousTurnId = turn.id;
+        activeTurnId = undefined;
+        onProgress("模型连接需要重新建立，正在重试尚未执行的请求。");
+        await call("send_message_to_thread", { threadId, hostId: "local", prompt: desktopPrompt,
+          ...(model ? { model } : {}), ...(effort ? { thinking: effort } : {}) });
+        continue;
+      }
       if (turn.status === "failed") throw new Error(turn.error?.message || `Codex turn ${turn.status}`);
       interruption.observe(threadId, activeTurnId);
       if (history.thread?.status?.activeFlags?.some(flag => /waiting|approval|input/i.test(flag))) {

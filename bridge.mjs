@@ -34,6 +34,7 @@ import {
   validateReasoningEffort,
 } from "./bridge-core.mjs";
 import { discoverCodexProjectPaths } from "./codex-projects.mjs";
+import { createModelCatalog } from "./codex-models.mjs";
 import { APP_SERVER_SESSION_BACKEND, canResumeAppServerSession, desktopCodexBinary, runAppServerTask } from "./codex-app-server.mjs";
 import { runDesktopTask } from "./codex-desktop.mjs";
 import { TaskSteering } from "./task-steering.mjs";
@@ -263,8 +264,6 @@ const config = {
 config.codex.modelGroups = buildModelChoiceGroups({
   configuredChoices: [
     ...parseListEnv("CODEX_MODEL_CHOICES"),
-    "gpt-5.5",
-    "gpt-5.4",
   ],
   configuredModel: config.codex.model,
   defaultModel: config.codex.defaultModel,
@@ -284,6 +283,16 @@ config.bridge.projectChoices = buildProjectChoices(
 );
 config.bridge.manualProjectChoices = config.bridge.projectChoices;
 const codexLauncher = resolveCodexLauncher(desktopCodexBinary(config.codex.bin));
+config.codex.modelCatalog = createModelCatalog({
+  ...codexLauncher,
+  env: { ...process.env, CODEX_HOME: codexHome },
+  configArgs: [
+    ...(config.codex.profile ? ["-c", `profile=${JSON.stringify(config.codex.profile)}`] : []),
+    ...config.codex.configOverrides.flatMap(value => ["-c", value]),
+  ],
+  configuredChoices: parseListEnv("CODEX_MODEL_CHOICES"),
+  onError: (error, cwd) => log("warn", "failed to refresh Codex model catalog; retaining previous choices", { cwd, error: String(error) }),
+});
 if (!["desktop", "app-server"].includes(config.codex.transport)) {
   throw new Error("CODEX_TASK_TRANSPORT must be desktop or app-server");
 }
@@ -654,7 +663,7 @@ function buildControlCard(runner, chatId, projectPath, notice = "", view = "home
   const task = tasks.find(t => ["running", "stopping"].includes(t.status)) || tasks.find(t => !["steered", "steer_unknown"].includes(t.status));
   return buildPanelCard({ chatId, projectPath, projectLabel: runner.projectAlias(projectPath), sessionName, task, notice, view, page,
     model: runner.effectiveModel(chatId, projectPath), reasoning: runner.effectiveReasoning(chatId, projectPath),
-    projects: config.bridge.projectChoices, models: [...(config.codex.modelGroups?.codex || []), ...(config.codex.modelGroups?.grok || [])],
+    projects: config.bridge.projectChoices, models: config.codex.modelCatalog?.get(projectPath)?.models || [...(config.codex.modelGroups?.codex || []), ...(config.codex.modelGroups?.grok || [])],
     reasoningChoices: config.codex.reasoningEffortChoices || [], sessions: runner.sessionStates(chatId, projectPath),
     queued: runner.queue.queued(sessionKey(chatId, projectPath, sessionName)), paused: runner.queue.isPaused(sessionKey(chatId, projectPath, sessionName)),
   });
@@ -1741,6 +1750,9 @@ async function handleNormalizedCardAction(event) {
   if (!currentCardMessageId) {
     runner.setControlCardMessageId(actionChatId, event.messageId);
   }
+  if (value.action === "show_models") {
+    await config.codex.modelCatalog?.refresh(runner.activeProjectPath(actionChatId));
+  }
   if (shouldRefreshProjectChoicesForCardAction(value.action)) {
     await refreshProjectChoices(`card:${value.action}`);
   }
@@ -1751,7 +1763,8 @@ async function handleNormalizedCardAction(event) {
   });
   const controlSession = value.sessionName || runner.activeSessionName(actionChatId, projectPath);
   let view = ["home", "projects", "sessions", "settings", "models", "reasoning", "queue"].includes(value.view) ? value.view : "home";
-  let notice = "";
+  let notice = value.action === "show_models" && config.codex.modelCatalog?.get(projectPath)?.error
+    ? "模型目录暂时无法刷新，显示上次列表；可重新打开模型页重试。" : "";
   if (["show_home", "show_projects", "show_sessions", "show_settings", "show_models", "show_reasoning", "show_queue"].includes(value.action)) {
     view = value.action.slice(5);
   } else if (value.action === "resume_queue") {
@@ -1889,6 +1902,12 @@ log("info", "starting Feishu Codex bridge", {
 await wsClient.start({ eventDispatcher: dispatcher });
 log("info", "Feishu WebSocket connected; waiting for messages");
 
+const startupModels = await config.codex.modelCatalog.refresh(config.bridge.defaultProjectPath);
+if (startupModels.models) {
+  config.codex.defaultModel = startupModels.defaultModel;
+  config.codex.defaultReasoningEffort = startupModels.defaultReasoningEffort;
+  log("info", "model choices refreshed from Codex", { count: startupModels.models.length, models: startupModels.models });
+}
 await refreshProjectChoices("startup");
 let projectRefreshTimer = null;
 if (
