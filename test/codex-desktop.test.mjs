@@ -76,7 +76,7 @@ test("desktop task dispatches the message through Desktop and updates sidebar me
   assert.equal(f.calls[send].args.thinking, "high");
   assert.ok(f.calls[send].args.prompt.includes("图片.png"));
   assert.equal(f.calls[move].args.projectId, "desktop-project");
-  assert.equal(controls[0].canCancel, false);
+  assert.equal(controls[0].canCancel, true);
   assert.equal(controls.at(-1), null);
 });
 
@@ -125,6 +125,37 @@ test("preparation failures release the task control", async () => {
 
 test("no Desktop connection fails clearly without silently executing an invisible task", async () => {
   await assert.rejects(runDesktopTask({ pipePath: null }), /请先打开客户端/);
+});
+
+test("a running Desktop turn is stopped through the owner channel and confirmed by its final status", async () => {
+  let control, reads = 0, stopped = false, request;
+  const f = fixture();
+  const original = f.options.callTool;
+  const result = await runDesktopTask({ ...f.options, pollIntervalMs: 1,
+    onControl: value => { if (value) control = value; },
+    onTurnStarted: () => { control.interrupt().catch(() => {}); },
+    interruptTurn: async (threadId, turnId) => { request = { threadId, turnId }; stopped = true; return { ok: true }; },
+    callTool: async (...args) => {
+      if (args[2] !== "read_thread") return original(...args);
+      reads++;
+      return { thread: { status: { type: "idle" } }, turns: [{ id: reads === 1 ? "before" : "active", status: reads === 1 ? "completed" : stopped ? "interrupted" : "inProgress", items: [] }] };
+    },
+  });
+  assert.deepEqual(request, { threadId: "thread-a", turnId: "active" });
+  assert.equal(result.turn.status, "interrupted");
+});
+
+test("stop intent during preparation prevents Desktop from receiving the model prompt", async () => {
+  let control;
+  const f = fixture();
+  const result = await runDesktopTask({ ...f.options, onControl: value => { if (value) control = value; }, onThread: () => control.interrupt() });
+  assert.equal(result.turn.status, "interrupted");
+  assert.ok(!f.calls.some(call => call.tool === "send_message_to_thread"));
+});
+
+test("Desktop's manual stop is returned as an interruption, not a provider failure", async () => {
+  const f = fixture({ finalStatus: "interrupted" });
+  assert.equal((await runDesktopTask(f.options)).turn.status, "interrupted");
 });
 
 test("pipe discovery follows Desktop restarts and rejects ambiguous clients", () => {

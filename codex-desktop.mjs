@@ -2,6 +2,8 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { CodexAppServer, matchingProjectId, resolveAppServerProjectId } from "./codex-app-server.mjs";
+import { interruptDesktopTurn } from "./codex-desktop-ipc.mjs";
+import { TurnInterrupt } from "./turn-interrupt.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
@@ -115,12 +117,15 @@ export async function prepareDesktopThread({ command, argsPrefix, configArgs, cw
 
 export async function runDesktopTask({
   prompt, imagePath, model, effort, cwd, threadId: existingId, timeoutMs = 1_200_000,
-  onThread = () => {}, onControl = () => {}, onOutput = () => {}, onProgress = () => {},
+  onThread = () => {}, onTurnStarted = () => {}, onControl = () => {}, onOutput = () => {}, onProgress = () => {},
+  interruptTurn = interruptDesktopTurn,
+  pollIntervalMs = 1500,
   pipePath = findDesktopPipe(), prepare = prepareDesktopThread, callTool = callDesktopTool, ...options
 }) {
   if (!pipePath) throw new Error("未检测到 Codex 客户端，请先打开客户端，再从飞书发送消息。");
   let finished = false;
-  onControl({ canCancel: false });
+  const interruption = new TurnInterrupt(interruptTurn);
+  onControl({ canCancel: true, interrupt: () => interruption.request() });
   try {
     const threadId = await prepare({ ...options, cwd, threadId: existingId, model });
     await onThread(threadId);
@@ -137,12 +142,13 @@ export async function runDesktopTask({
     if (baseline.thread?.status?.type === "active") throw new Error("这条会话正在 Codex 客户端执行任务，请等待完成后再从飞书发送消息。");
     const previousTurnId = baseline.turns?.[0]?.id;
     const desktopPrompt = imagePath ? `${prompt}\n\n用户上传的图片保存在本机：${JSON.stringify(imagePath)}。请先使用图片查看工具读取这张图片。` : prompt;
+    if (!interruption.beginSubmission()) return { threadId, turn: { status: "interrupted" }, output: "任务在提交前已停止。" };
     await call("send_message_to_thread", { threadId, hostId: "local", prompt: desktopPrompt,
       ...(model ? { model } : {}), ...(effort ? { thinking: effort } : {}) });
     if (projectId) await call("move_thread_to_project", { threadId, hostId: "local", projectId });
     onProgress("Codex 客户端已开始处理任务。");
     let activeTurnId;
-    onControl({ canCancel: false, steer: prompt => {
+    onControl({ canCancel: true, interrupt: () => interruption.request(), steer: prompt => {
       if (finished) throw new Error("当前轮次已结束，无法引导。");
       return steerDesktopTask({ pipePath, threadId, turnId: activeTurnId, prompt, callTool });
     } });
@@ -153,23 +159,24 @@ export async function runDesktopTask({
       const history = await call("read_thread", { threadId, hostId: "local", turnLimit: 1, maxOutputCharsPerItem: 20_000 });
       const turn = history.turns?.[0];
       if (!turn || turn.id === previousTurnId) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
         continue;
       }
-      activeTurnId ||= turn.id;
+      if (!activeTurnId) { activeTurnId = turn.id; onTurnStarted({ threadId, turnId: turn.id }); }
       if (turn.id !== activeTurnId) throw new Error("Codex 客户端已切换轮次，请在客户端查看原任务结果。");
       const messages = turn.items?.filter(i => i.type === "agentMessage") || [];
       const final = messages.filter(i => i.phase === "final_answer");
       const output = (final.length ? final : messages).map(i => i.text).join("\n\n");
       if (output) onOutput(output);
-      if (turn.status === "completed") return { threadId, turn, output };
-      if (["failed", "interrupted"].includes(turn.status)) throw new Error(turn.error?.message || `Codex turn ${turn.status}`);
+      if (["completed", "interrupted"].includes(turn.status)) return { threadId, turn, output };
+      if (turn.status === "failed") throw new Error(turn.error?.message || `Codex turn ${turn.status}`);
+      interruption.observe(threadId, activeTurnId);
       if (history.thread?.status?.activeFlags?.some(flag => /waiting|approval|input/i.test(flag))) {
         throw new Error("Codex 客户端需要确认或输入，请到对应聊天中处理。");
       }
       onProgress("Codex 客户端正在执行任务。");
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     }
     throw new Error("等待 Codex 回复超时；任务可能仍在客户端执行，请在客户端查看或停止。");
-  } finally { finished = true; onControl(null); }
+  } finally { finished = true; interruption.finish(); onControl(null); }
 }

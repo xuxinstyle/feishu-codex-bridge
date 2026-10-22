@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node bridge.mjs",
     "check": "node --check bridge.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "preview:cards": "node scripts/preview-cards.mjs --serve",
+    "test:live": "node scripts/verify-task-resume.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.1.1"

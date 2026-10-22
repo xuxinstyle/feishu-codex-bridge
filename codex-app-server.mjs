@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { TurnInterrupt } from "./turn-interrupt.mjs";
 
 export const APP_SERVER_SESSION_BACKEND = "app-server-v1";
 
@@ -157,7 +158,7 @@ export async function runAppServerTask({
   command, argsPrefix, configArgs, cwd, env, shell, spawnImpl,
   threadId: resumeId = null, model = "", effort = "", sandbox = "workspace-write", approvalPolicy = "never",
   prompt, imagePath = "", name, timeoutMs = 1_200_000,
-  onControl = () => {}, onThread = () => {}, onOutput = () => {}, onProgress = () => {}, onDiagnostic = () => {},
+  onControl = () => {}, onThread = () => {}, onTurnStarted = () => {}, onOutput = () => {}, onProgress = () => {}, onDiagnostic = () => {},
 }) {
   const rpc = new CodexAppServer({ command, argsPrefix, configArgs, cwd, env, shell, spawnImpl });
   let threadId = resumeId;
@@ -194,7 +195,10 @@ export async function runAppServerTask({
       rpc.close();
     }
   };
+  const interruption = new TurnInterrupt((threadId, turnId) => rpc.request("turn/interrupt", { threadId, turnId }));
   const control = {
+    canCancel: true,
+    interrupt: () => interruption.request(),
     cancel: () => stop(new Error("Codex task cancelled")),
     steer: async (prompt) => {
       if (settled || stopping || !threadId || !turnId) throw new Error("当前轮次尚未开始或已结束，无法引导。");
@@ -214,13 +218,14 @@ export async function runAppServerTask({
   rpc.on("disconnect", (error) => finish(error));
   rpc.on("interactiveRequest", (method) => stop(new Error(`飞书暂不支持交互请求 ${method}，请在 Codex 客户端处理后重试。`)));
   const complete = (turn) => {
-    if (turn.status === "completed") finish(null, turn);
+    if (["completed", "interrupted"].includes(turn.status)) finish(null, turn);
     else finish(new Error(turn.error?.message || `Codex turn ${turn.status || "failed"}`));
   };
   rpc.on("notification", (method, params) => {
     if (params.threadId !== threadId || settled) return;
     if (method === "turn/started") {
       turnId ||= params.turn?.id;
+      if (turnId) { onTurnStarted({ threadId, turnId }); interruption.observe(threadId, turnId); }
       onProgress("Codex 已开始处理任务。");
     }
     if (turnId && params.turnId && params.turnId !== turnId) return;
@@ -268,8 +273,11 @@ export async function runAppServerTask({
     if (!resumeId && name) await rpc.request("thread/name/set", { threadId, name });
     const input = [{ type: "text", text: prompt, text_elements: [] }];
     if (imagePath) input.push({ type: "localImage", path: imagePath });
+    if (!interruption.beginSubmission()) return { threadId, turn: { status: "interrupted" }, output: "任务在提交前已停止。" };
     const started = await rpc.request("turn/start", { threadId, input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
     turnId = started.turn.id;
+    onTurnStarted({ threadId, turnId });
+    interruption.observe(threadId, turnId);
     if (completedTurns.has(turnId)) complete(completedTurns.get(turnId));
     return await done;
   } catch (error) {
@@ -279,6 +287,7 @@ export async function runAppServerTask({
     clearTimeout(timeout);
     // Remove disconnect listener before intentional shutdown after a request error.
     settled = true;
+    interruption.finish();
     rpc.close();
     onControl(null);
   }

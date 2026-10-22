@@ -3,6 +3,14 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import * as bridgeCore from "../bridge-core.mjs";
 
+test("stop and resume controls use exact commands without intercepting ordinary discussion", () => {
+  for (const input of ["/stop", "停止", "停一下"]) assert.equal(bridgeCore.parseCommand(input).type, "stop");
+  assert.equal(bridgeCore.parseCommand("/stop task-123").taskId, "task-123");
+  for (const input of ["不要停止", "怎么停止任务", "暂停功能如何实现"]) assert.equal(bridgeCore.parseCommand(input).type, "run");
+  assert.equal(bridgeCore.parseCommand("继续").type, "resume");
+  assert.equal(bridgeCore.parseCommand("/queue").type, "queue");
+});
+
 import {
   buildModelArgs,
   buildModelChoiceGroups,
@@ -203,20 +211,18 @@ test("Codex sessions only resume when their stored model matches the requested m
   );
 });
 
-test("bridge config includes Grok presets and grouped model card sections", () => {
+test("bridge keeps model choices available through the compact card renderer", () => {
   const source = readFileSync(new URL("../bridge.mjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.match(source, /buildModelChoiceGroups/);
-  assert.match(source, /Grok models/);
-  assert.match(source, /Codex\/provider models/);
-  assert.match(source, /modelGroups\.grok/);
-  assert.match(source, /modelGroups\.codex/);
+  assert.match(source, /buildPanelCard/);
+  assert.match(source, /modelGroups\?\.grok/);
+  assert.match(source, /modelGroups\?\.codex/);
   assert.match(source, /runAppServerTask/);
   assert.match(source, /messageResource\.get/);
   assert.match(source, /imagePath: task\.imagePath/);
   assert.match(source, /imageKey/);
   assert.match(source, /canResumeAppServerSession/);
   assert.match(source, /model: task\.model/);
-  assert.match(source, /model: this\.effectiveModel\(source\.chatId, projectPath\)/);
   assert.doesNotMatch(source, /taskModel/);
   assert.match(source, /controlCardMessageId/);
   assert.match(source, /ignored action from stale control card/);

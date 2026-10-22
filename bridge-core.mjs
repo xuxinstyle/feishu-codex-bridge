@@ -64,6 +64,12 @@ export function parseCommand(text) {
   const cancelMatch = trimmed.match(/^\/cancel\s+(task-\S+)$/);
   if (cancelMatch) return { type: "cancel", taskId: cancelMatch[1] };
 
+  const stopMatch = trimmed.match(/^\/stop(?:\s+(.*))?$/i);
+  if (stopMatch || ["停止", "停一下"].includes(trimmed)) return { type: "stop", taskId: stopMatch?.[1]?.trim() || undefined };
+  const resumeMatch = trimmed.match(/^\/resume(?:\s+(.*))?$/i);
+  if (resumeMatch || trimmed === "继续") return { type: "resume", taskId: resumeMatch?.[1]?.trim() || undefined };
+  if (trimmed === "/queue") return { type: "queue" };
+
   const steerMatch = trimmed.match(/^\/(?:steer|引导)(?:\s+([\s\S]+))?$/i);
   if (steerMatch) {
     const prompt = (steerMatch[1] || "").trim();

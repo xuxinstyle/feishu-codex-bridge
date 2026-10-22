@@ -36,8 +36,11 @@ import {
 import { discoverCodexProjectPaths } from "./codex-projects.mjs";
 import { APP_SERVER_SESSION_BACKEND, canResumeAppServerSession, desktopCodexBinary, runAppServerTask } from "./codex-app-server.mjs";
 import { runDesktopTask } from "./codex-desktop.mjs";
-import { TaskSteering, buildSteeringCard } from "./task-steering.mjs";
+import { TaskSteering } from "./task-steering.mjs";
 import { uploadAndSendFeishuImage } from "./feishu-media.mjs";
+import { SessionTaskQueue } from "./task-queue.mjs";
+import { TaskInterruption } from "./task-interruption.mjs";
+import { buildPanelCard, buildTaskCard } from "./feishu-cards.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
 const HOME_CONFIG_PATH = path.join(HOME_CONFIG_DIR, "config.env");
@@ -462,7 +465,7 @@ function getHelpMessage() {
     "- /panel：发送按钮控制卡片",
     "- /run <描述>：在默认仓库执行",
     "- /run <路径> <描述>：指定仓库或目录执行",
-    "- 直接发送图片：下载图片后交给 Codex 通过 -i 参数分析",
+    "- 直接发送图片：交给 Codex 分析图片",
     "- 连续发送多个任务会排队执行，不会自动取消前一个任务",
     "- 排队文字消息可点击「引导」提交给当前任务，不中断运行；也可发送 /steer 补充要求",
     "- /sessions：查看当前仓库的 Codex session",
@@ -471,7 +474,7 @@ function getHelpMessage() {
     "- /new：清除当前 active session 映射",
     "- /model：查看当前聊天窗口的模型覆盖",
     "- /model <模型名>：切换当前聊天窗口后续任务使用的模型，例如 /model gpt-5.5",
-    "- /panel：面板提供 grok-4.6、grok-4.5 和配置的 Codex/provider 模型按钮；其他模型可直接用 /model <模型名>",
+    "- /panel → 设置：切换模型和推理强度；其他模型可直接用 /model <模型名>",
     "- /model <模型名> <推理强度>：同时切换模型和推理强度，例如 /model gpt-5.5 high",
     "- /model default：清除模型覆盖，回到 CODEX_MODEL 或 ~/.codex/config.toml",
     "- /reasoning <low|medium|high|xhigh|max|ultra>：切换当前项目的推理强度",
@@ -479,7 +482,10 @@ function getHelpMessage() {
     "- /project：查看当前聊天窗口项目",
     "- /project <别名或路径>：切换当前聊天窗口后续任务使用的项目",
     "- /status：查看最近任务",
-    "- /cancel task-xxxx：取消任务",
+    "- /stop 或 停止：停止当前任务，暂停当前会话旧待办",
+    "- /resume 或 继续：继续最近停止的任务",
+    "- /queue：查看待办并恢复执行",
+    "- /cancel task-xxxx：取消排队，或停止指定任务",
     "- /help：显示帮助",
   ].join("\n");
 }
@@ -532,6 +538,15 @@ class FeishuMessenger {
         content: JSON.stringify(card),
       },
     });
+    assertFeishuApiSuccess(res, "发送任务卡片");
+    return res?.data?.message_id;
+  }
+
+  async sendCard(chatId, card) {
+    const res = await this.client.im.message.create({ params: { receive_id_type: "chat_id" },
+      data: { receive_id: chatId, msg_type: "interactive", content: JSON.stringify(card) },
+    });
+    assertFeishuApiSuccess(res, "发送任务卡片");
     return res?.data?.message_id;
   }
 
@@ -606,10 +621,6 @@ function sessionKey(chatId, projectPath, sessionName) {
 
 const CARD_BRIDGE_ID = "feishu-codex-bridge";
 
-function cardActionValue(action, extra = {}) {
-  return { bridge: CARD_BRIDGE_ID, action, ...extra };
-}
-
 function parseCardActionValue(value) {
   if (value && typeof value === "object") return value;
   if (typeof value === "string") {
@@ -621,17 +632,6 @@ function parseCardActionValue(value) {
     }
   }
   return null;
-}
-
-function cardButton(text, action, extra = {}, type = "default", confirm = null) {
-  const button = {
-    tag: "button",
-    text: { tag: "plain_text", content: text },
-    type,
-    value: cardActionValue(action, extra),
-  };
-  if (confirm) button.confirm = confirm;
-  return button;
 }
 
 function firstNonEmptyLine(text) {
@@ -647,158 +647,17 @@ function compactText(text, maxLength = 90) {
   return line.length > maxLength ? `${line.slice(0, maxLength - 3)}...` : line;
 }
 
-function buildControlCard(runner, chatId, projectPath, notice = "", view = "sessions") {
-  const activeName = runner.activeSessionName(chatId, projectPath);
-  const sessions = runner.sessionStates(chatId, projectPath);
-  const recentTask = runner.recentTask(chatId);
-  const pendingCount = runner.pendingCount(chatId);
-  const scopedModel = runner.modelOverride(chatId, projectPath);
-  const modelText = runner.effectiveModel(chatId, projectPath) || "未设置";
-  const scopedReasoning = runner.reasoningOverride(chatId, projectPath);
-  const reasoningText = runner.effectiveReasoning(chatId, projectPath) || "未设置";
-  const projectAlias = runner.projectAlias(projectPath);
-  const scopedButton = (text, action, extra = {}, type = "default", confirm = null) =>
-    cardButton(text, action, { scopeChatId: chatId, projectPath, ...extra }, type, confirm);
-  const recentTaskText = recentTask
-    ? `${recentTask.taskId} / ${recentTask.status} / session=${recentTask.sessionName || "default"}`
-    : "无";
-  const sessionLines =
-    sessions.length > 0
-      ? sessions
-          .map((item) => {
-            const mark = item.name === activeName ? "*" : "-";
-            const taskPart = item.taskId ? ` task=${item.taskId}` : "";
-            const turnsPart = item.turns > 0 ? ` turns=${item.turns}` : "";
-            const progressPart = item.progress ? `\n  ${item.progress}` : "";
-            return `${mark} ${item.name} [${item.status}]${taskPart}${turnsPart}${progressPart}`;
-          })
-          .join("\n")
-      : "暂无 session；当前 active 会在下一次任务完成后保存。";
-  const sessionButtons = sessions
-    .slice(0, 5)
-    .map((item) =>
-      scopedButton(
-        item.name === activeName ? `当前 ${item.name}` : `切到 ${item.name}`,
-        "use_session",
-        { sessionName: item.name },
-        item.name === activeName ? "primary" : "default"
-      )
-    );
-  const cancelButtons = sessions
-    .filter((item) => item.taskId && ["pending", "running"].includes(item.status))
-    .slice(0, 5)
-    .map((item) =>
-      scopedButton(
-        `取消 ${item.name}`,
-        "cancel_task",
-        { taskId: item.taskId },
-        "danger",
-        {
-          title: { tag: "plain_text", content: "取消任务?" },
-          text: { tag: "plain_text", content: `将取消 ${item.name} 的任务 ${item.taskId}。` },
-        }
-      )
-    );
-  const primaryActions = [
-    scopedButton("新建会话", "new_session", {}, "primary"),
-    scopedButton("会话列表", "show_sessions"),
-    scopedButton("刷新列表", "refresh"),
-  ];
-  const projectButtons = config.bridge.projectChoices
-    .slice(0, 8)
-    .map((item) =>
-      scopedButton(
-        item.path === projectPath ? `当前 ${item.alias}` : `项目 ${item.alias}`,
-        "set_project",
-        { targetProjectPath: item.path },
-        item.path === projectPath ? "primary" : "default"
-      )
-    );
-  const modelButtons = (models) =>
-    models.slice(0, 8).map((model) =>
-      scopedButton(
-        model === modelText ? `当前 ${model}` : `模型 ${model}`,
-        "set_model",
-        { model },
-        model === modelText ? "primary" : "default"
-      )
-    );
-  const grokButtons = modelButtons(config.codex.modelGroups.grok);
-  const codexButtons = modelButtons(config.codex.modelGroups.codex);
-  const reasoningButtons = config.codex.reasoningEffortChoices
-    .slice(0, 8)
-    .map((effort) =>
-      scopedButton(
-        effort === reasoningText ? `当前 ${effort}` : `推理 ${effort}`,
-        "set_reasoning",
-        { reasoningEffort: effort },
-        effort === reasoningText ? "primary" : "default"
-      )
-    );
-  const manageActions = [
-    scopedButton("清除模型", "clear_model"),
-    scopedButton("清除推理", "clear_reasoning"),
-    scopedButton(
-      "重置当前会话",
-      "reset_active_session",
-      {},
-      "danger",
-      {
-        title: { tag: "plain_text", content: "重置当前会话?" },
-        text: { tag: "plain_text", content: "这会清除当前 active session 的 thread 映射，下一条消息会新开 Codex 对话。" },
-      }
-    ),
-  ];
-  return {
-    config: { wide_screen_mode: true, update_multi: true },
-    header: {
-      template: "blue",
-      title: { tag: "plain_text", content: "Codex 会话" },
-    },
-    elements: [
-      {
-        tag: "markdown",
-        content: [
-          `**project**: ${projectAlias} (${projectPath})`,
-          `**active session**: ${activeName}`,
-          `**model**: ${modelText}${scopedModel ? " (chat override)" : ""}`,
-          `**reasoning**: ${reasoningText}${scopedReasoning ? " (chat override)" : ""}`,
-          `**queued/running**: ${pendingCount}`,
-          `**recent task**: ${recentTaskText}`,
-          notice ? `**提示**: ${notice}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      },
-      { tag: "hr" },
-      { tag: "action", layout: "flow", actions: primaryActions },
-      { tag: "hr" },
-      { tag: "markdown", content: "**projects**" },
-      projectButtons.length > 0 ? { tag: "action", layout: "flow", actions: projectButtons } : null,
-      { tag: "markdown", content: "**Grok models**" },
-      grokButtons.length > 0 ? { tag: "action", layout: "flow", actions: grokButtons } : null,
-      { tag: "markdown", content: "**Codex/provider models**" },
-      codexButtons.length > 0 ? { tag: "action", layout: "flow", actions: codexButtons } : null,
-      { tag: "markdown", content: "**reasoning effort**" },
-      reasoningButtons.length > 0 ? { tag: "action", layout: "flow", actions: reasoningButtons } : null,
-      { tag: "hr" },
-      { tag: "markdown", content: `**sessions / progress**\n${sessionLines}` },
-      sessionButtons.length > 0 ? { tag: "action", layout: "flow", actions: sessionButtons } : null,
-      cancelButtons.length > 0 ? { tag: "action", layout: "flow", actions: cancelButtons } : null,
-      { tag: "hr" },
-      { tag: "action", layout: "flow", actions: manageActions },
-      {
-        tag: "note",
-        elements: [
-          {
-            tag: "plain_text",
-            content:
-              "项目、模型和推理强度只影响后续任务；面板列出 Grok 预设和 Codex/provider 候选。要使用其他已配置模型可发送 /model <模型名>；要自定义 session 名称可发送 /new 名字。",
-          },
-        ],
-      },
-    ].filter(Boolean),
-  };
+function buildControlCard(runner, chatId, projectPath, notice = "", view = "home", page = 0, scopedSession = null) {
+  const sessionName = scopedSession || runner.activeSessionName(chatId, projectPath);
+  const tasks = [...runner.tasks.values()].filter(task => task.source.chatId === chatId && task.projectPath === projectPath && task.sessionName === sessionName)
+    .sort((a, b) => b.createdAt - a.createdAt);
+  const task = tasks.find(t => ["running", "stopping"].includes(t.status)) || tasks.find(t => !["steered", "steer_unknown"].includes(t.status));
+  return buildPanelCard({ chatId, projectPath, projectLabel: runner.projectAlias(projectPath), sessionName, task, notice, view, page,
+    model: runner.effectiveModel(chatId, projectPath), reasoning: runner.effectiveReasoning(chatId, projectPath),
+    projects: config.bridge.projectChoices, models: [...(config.codex.modelGroups?.codex || []), ...(config.codex.modelGroups?.grok || [])],
+    reasoningChoices: config.codex.reasoningEffortChoices || [], sessions: runner.sessionStates(chatId, projectPath),
+    queued: runner.queue.queued(sessionKey(chatId, projectPath, sessionName)), paused: runner.queue.isPaused(sessionKey(chatId, projectPath, sessionName)),
+  });
 }
 
 class TaskRunner {
@@ -820,6 +679,16 @@ class TaskRunner {
     this.sessionGenerations = new Map();
     this.activeTasks = new Map();
     this.sessionQueues = new Map();
+    this.publishSerial = createKeyedSerialExecutor();
+    this.queue = new SessionTaskQueue({ run: task => this.run(task), paused: state.pausedQueues || [],
+      onChange: () => this.persistSessionState(), onError: (error, task) => log("error", "task queue error", { taskId: task.taskId, error: String(error) }),
+    });
+    this.interruption = new TaskInterruption({ tasks: this.tasks, controls: this.activeTasks,
+      pause: task => this.queue.pause(sessionKey(task.source.chatId, task.projectPath, task.sessionName)),
+      isCurrent: task => task.sessionGeneration === (this.sessionGenerations.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName)) || 0),
+      onChange: task => { this.publishTaskText(task, task.status === "stopping" ? "正在请求停止当前任务…" : "").catch(error => log("warn", "task card update failed", { error: String(error) })); },
+      onError: (task, error) => log("warn", "task interruption failed", { taskId: task.taskId, error: String(error) }),
+    });
     this.steering = new TaskSteering({ tasks: this.tasks, controls: this.activeTasks,
       isCurrent: task => task.sessionGeneration === (this.sessionGenerations.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName)) || 0),
     });
@@ -828,6 +697,7 @@ class TaskRunner {
   persistSessionState() {
     writeSessionState({
       version: 1,
+      pausedQueues: this.queue.snapshot(),
       savedAt: new Date().toISOString(),
       sessions: [...this.sessions.entries()],
       activeSessions: [...this.activeSessions.entries()],
@@ -851,25 +721,21 @@ class TaskRunner {
     if (messageId) this.persistSessionState();
   }
 
-  async publishTaskText(task, text, { rotateOnAnyUpdateError = false } = {}) {
-    const previousMessageId = task.statusMessageId;
-    const result = await updateOrRotateTextMessage({
-      messageId: previousMessageId,
-      text,
-      updateText: (messageId, nextText) => this.messenger.updateText(messageId, nextText),
-      createText: (nextText) => this.messenger.sendText(task.source.chatId, nextText),
-      rotateOnAnyUpdateError,
-    });
-    task.statusMessageId = result.messageId || null;
-    if (result.rotated && previousMessageId) {
-      log("info", "rotated task status message", {
-        taskId: task.taskId,
-        previousMessageId,
-        statusMessageId: task.statusMessageId,
-        updateErrorCode: findFeishuApiErrorCode(result.updateError),
+  async publishTaskText(task, text = "", { rotateOnAnyUpdateError = false } = {}) {
+    if (!task) return;
+    return this.publishSerial(task.taskId, async () => {
+      const card = buildTaskCard(task, { projectLabel: this.projectAlias(task.projectPath), text,
+        pendingCount: this.queue.queued(sessionKey(task.source.chatId, task.projectPath, task.sessionName)).length,
+        paused: this.queue.isPaused(sessionKey(task.source.chatId, task.projectPath, task.sessionName)),
       });
-    }
-    return result;
+      const result = await updateOrRotateTextMessage({ messageId: task.statusMessageId, text: card,
+        updateText: (id, next) => this.messenger.updateCard(id, next),
+        createText: next => this.messenger.sendCard(task.source.chatId, next), rotateOnAnyUpdateError,
+      });
+      task.statusMessageId = result.messageId || null;
+      if (task.steerTargetTaskId && task.status === "pending") task.steerCardMessageId = task.statusMessageId;
+      return result;
+    });
   }
 
   markKnownSession(chatId, projectPath, sessionName) {
@@ -1070,27 +936,38 @@ class TaskRunner {
     return { sessionName: normalized, existed };
   }
 
-  cancelTask(taskId) {
-    const task = this.tasks.get(taskId);
-    if (!task || task.steeringDone || ["success", "failed", "cancelled", "steered"].includes(task.status)) return false;
-    if (this.activeTasks.get(taskId)?.canCancel === false) return false;
-    task.status = "cancelled";
-    if (this.activeTasks.has(taskId)) this.killActive(taskId);
-    return true;
+  stopTask(taskId, scope) { return this.interruption.stop(taskId, scope); }
+
+  currentTask(chatId, projectPath) {
+    const name = this.activeSessionName(chatId, projectPath);
+    return [...this.tasks.values()].find(t => t.source.chatId === chatId && t.projectPath === projectPath && t.sessionName === name && ["running", "stopping"].includes(t.status) && this.steering.isCurrent(t));
   }
 
-  cancelFailureMessage(taskId) {
-    if (this.tasks.get(taskId)?.steeringDone) return "这条消息正在提交引导，请等待提交结果。";
-    return this.activeTasks.get(taskId)?.canCancel === false
-      ? "这个任务正在 Codex 客户端执行，请在对应聊天中点击停止。"
-      : `无法取消 task=${taskId || "unknown"}，任务可能已完成或不存在`;
+  async resumeTask(taskId, source) {
+    const task = this.tasks.get(taskId);
+    if (!task || task.source.chatId !== source.chatId || (task.source.senderId && task.source.senderId !== source.senderId) || task.status !== "interrupted") {
+      throw new Error("这条任务没有处于已停止状态，或不属于当前聊天和用户。");
+    }
+    if (!this.steering.isCurrent(task)) throw new Error("会话已经重置，旧任务卡片不能继续执行。");
+    if (this.currentTask(source.chatId, task.projectPath)) throw new Error("当前会话还有任务正在执行，请等待结束。");
+    if (task.resumedAs) throw new Error("这条任务已经继续，请查看新的任务卡片。");
+    if (!task.resumeOperation) task.resumeOperation = this.create(source, task.projectPath,
+      `请继续刚才被停止的任务，先核对已经完成的进展，再接着完成。\n原任务：${task.prompt}`, task.sessionName, task.imageKey, {
+        threadId: task.threadId, model: task.model, reasoningOverride: task.reasoningOverride,
+        imageMessageId: task.imageMessageId || task.source.messageId,
+      }).then(next => {
+        task.resumedAs = next.taskId;
+        this.publishTaskText(task, "已开始继续任务，请查看新的任务卡片。").catch(() => {});
+        return next;
+      });
+    return task.resumeOperation;
   }
 
   pendingCount(chatId = null) {
     let count = 0;
     for (const task of this.tasks.values()) {
       if (chatId && task.source.chatId !== chatId) continue;
-      if (["pending", "running"].includes(task.status)) count += 1;
+      if (["pending", "running", "stopping"].includes(task.status)) count += 1;
     }
     return count;
   }
@@ -1103,7 +980,7 @@ class TaskRunner {
         task.source.chatId === chatId &&
         task.projectPath === projectPath &&
         (task.sessionName || "default") === normalized &&
-        ["pending", "running"].includes(task.status)
+        ["pending", "running", "stopping"].includes(task.status)
       ) {
         count += 1;
       }
@@ -1137,7 +1014,7 @@ class TaskRunner {
           )
           .sort((a, b) => b.createdAt - a.createdAt);
         const activeTask =
-          tasks.find((task) => ["running", "pending"].includes(task.status)) || tasks[0] || null;
+          tasks.find((task) => ["running", "pending", "stopping"].includes(task.status)) || tasks[0] || null;
         const status = activeTask ? activeTask.status : session ? "idle" : "new";
         const progress =
           activeTask
@@ -1165,7 +1042,7 @@ class TaskRunner {
       });
   }
 
-  async create(source, projectPath, prompt, sessionName, imageKey = "") {
+  async create(source, projectPath, prompt, sessionName, imageKey = "", resume = null) {
     const normalizedSessionName = normalizeSessionName(sessionName);
     const ahead = this.pendingCountForSession(source.chatId, projectPath, normalizedSessionName);
     const steerTarget = this.steering.active(source.chatId, projectPath, normalizedSessionName);
@@ -1176,6 +1053,8 @@ class TaskRunner {
       sessionName: normalizedSessionName,
       prompt,
       imageKey,
+      imageMessageId: resume?.imageMessageId || source.messageId,
+      resumeThreadId: resume?.threadId || null,
       status: "pending",
       createdAt: Date.now(),
       startedAt: null,
@@ -1187,30 +1066,25 @@ class TaskRunner {
       progress: "",
       lastEventAt: null,
       modelOverride: this.modelOverride(source.chatId, projectPath),
-      reasoningOverride: this.reasoningOverride(source.chatId, projectPath),
-      model: this.effectiveModel(source.chatId, projectPath),
+      reasoningOverride: resume?.reasoningOverride ?? this.reasoningOverride(source.chatId, projectPath),
+      model: resume?.model || this.effectiveModel(source.chatId, projectPath),
       steerTargetTaskId: steerTarget?.taskId,
       sessionGeneration: this.sessionGenerations.get(sessionKey(source.chatId, projectPath, normalizedSessionName)) || 0,
     };
+    task.generation = task.taskId;
     this.tasks.set(task.taskId, task);
     try {
-      const queueText =
-        ahead > 0
-          ? `Codex 已收到任务 ${task.taskId}，session=${task.sessionName}，已加入该会话队列，前面还有 ${ahead} 个任务。`
-          : `Codex 已收到任务 ${task.taskId}，session=${task.sessionName}，即将开始执行。`;
-      task.statusMessageId = await this.messenger.replyText(task.source.messageId, queueText);
+      task.statusMessageId = await this.messenger.replyCard(task.source.messageId, buildTaskCard(task, {
+        projectLabel: this.projectAlias(projectPath), pendingCount: ahead,
+        paused: this.queue.isPaused(sessionKey(source.chatId, projectPath, task.sessionName)),
+      }));
+      if (steerTarget && !imageKey) task.steerCardMessageId = task.statusMessageId;
     } catch (error) {
-      log("warn", "failed to send queue reply", { taskId: task.taskId, error: String(error) });
-    }
-    if (steerTarget && !imageKey) {
-      try { task.steerCardMessageId = await this.messenger.replyCard(source.messageId, buildSteeringCard(task)); }
-      catch (error) { log("warn", "failed to send steering card", { taskId: task.taskId, error: String(error) }); }
+      log("warn", "failed to send task card", { taskId: task.taskId, error: String(error) });
     }
     const key = sessionKey(task.source.chatId, task.projectPath, task.sessionName);
-    const queue = this.sessionQueues.get(key) || Promise.resolve();
-    this.sessionQueues.set(key, queue.then(() => this.run(task)).catch((error) => {
-      log("error", "task queue error", { taskId: task.taskId, error: String(error) });
-    }));
+    this.queue.enqueue(key, task, { priority: this.queue.isPaused(key) });
+    this.sessionQueues.set(key, this.queue.idle(key));
     return task;
   }
 
@@ -1247,6 +1121,12 @@ class TaskRunner {
 
   async run(task) {
     if (!await this.steering.claimForRun(task)) return;
+    if (!this.steering.isCurrent(task)) {
+      task.status = "cancelled";
+      task.finishedAt = Date.now();
+      await this.publishTaskText(task, "会话已重置，这条旧待办已取消。", { rotateOnAnyUpdateError: true }).catch(() => {});
+      return;
+    }
     task.startedAt = Date.now();
     task.lastEventAt = task.startedAt;
     let imageDownloadPath = "";
@@ -1255,7 +1135,7 @@ class TaskRunner {
     let lastPushed = "";
 
     try {
-      await this.publishTaskText(task, `Codex 开始执行任务 ${task.taskId}...`);
+      await this.publishTaskText(task, "正在准备你的任务。");
     } catch (error) {
       log("warn", "failed to send initial reply", { taskId: task.taskId, error: String(error) });
     }
@@ -1269,13 +1149,14 @@ class TaskRunner {
       const elapsed = task.startedAt ? formatDuration(now - task.startedAt) : "0s";
       const lastEventAgo = task.lastEventAt ? formatDuration(now - task.lastEventAt) : "unknown";
       const body = truncateText(task.output || task.progress || "Codex 正在执行，暂时还没有可展示输出。");
-      const text = `${body}\n\n状态: ${task.status}  task=${task.taskId}  elapsed=${elapsed}  last_event=${lastEventAgo} ago`;
-      if (!force && text === lastPushed) return;
+      const text = body;
+      const signature = `${task.status}:${elapsed}:${text}`;
+      if (!force && signature === lastPushed) return;
       const operation = this.publishTaskText(task, text);
       pushInFlight = operation;
       try {
         await operation;
-        lastPushed = text;
+        lastPushed = signature;
       } catch (error) {
         log("warn", "failed to update status message", { taskId: task.taskId, error: String(error) });
       } finally {
@@ -1291,7 +1172,7 @@ class TaskRunner {
       if (task.imageKey) {
         imageDownloadPath = path.join(tmpdir(), `feishu-codex-${task.taskId}-image.download`);
         const downloaded = await this.messenger.downloadMessageResource(
-          task.source.messageId,
+          task.imageMessageId,
           task.imageKey,
           imageDownloadPath
         );
@@ -1312,9 +1193,9 @@ class TaskRunner {
         });
       }
 
-      if (task.status === "cancelled") return;
+      if (task.stopRequested || task.status === "cancelled") { task.status = task.stopRequested ? "interrupted" : "cancelled"; return; }
       const existing = this.sessions.get(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
-      const threadId = canResumeAppServerSession(existing, task.model) ? existing.threadId : null;
+      const threadId = task.resumeThreadId || (canResumeAppServerSession(existing, task.model) ? existing.threadId : null);
       const name = `[飞书] ${path.basename(task.projectPath)} · ${task.sessionName}`;
       log("info", "starting Codex task", {
         taskId: task.taskId, cwd: task.projectPath, command: codexLauncher.command, threadId, transport: config.codex.transport,
@@ -1345,6 +1226,7 @@ class TaskRunner {
           if (control) this.activeTasks.set(task.taskId, control);
           else this.activeTasks.delete(task.taskId);
         },
+        onTurnStarted: ({ turnId }) => { task.turnId = turnId; },
         onThread: (id) => {
           task.threadId = id;
           task.desktopName = name;
@@ -1358,10 +1240,12 @@ class TaskRunner {
         },
       });
       task.output = result.output || task.output;
-      this.saveAppServerSession(task, result.threadId, { completed: true });
+      this.saveAppServerSession(task, result.threadId, { completed: Boolean(result.turn?.id) });
 
       if (task.status === "cancelled") return;
-      task.status = "success";
+      task.status = result.turn?.status === "interrupted" ? "interrupted" : "success";
+      task.stopError = "";
+      if (task.status === "interrupted") this.queue.pause(sessionKey(task.source.chatId, task.projectPath, task.sessionName));
     } catch (error) {
       if (task.status !== "cancelled") {
         task.status = "failed";
@@ -1369,6 +1253,7 @@ class TaskRunner {
         if (!task.output) task.output = task.error;
       }
     } finally {
+      this.interruption.finish(task);
       if (pushTimer) clearInterval(pushTimer);
       if (pushInFlight) {
         try {
@@ -1407,18 +1292,12 @@ class TaskRunner {
           : imageDeliveryError
             ? `\n图片发送失败: ${imageDeliveryError}`
             : "";
-      const finalText =
-        task.status === "success"
-          ? `${truncateText(task.output || "Codex 已完成。")}\n\n完成: ${seconds}s  task=${task.taskId}${imageDeliveryNote}`
-          : task.status === "cancelled"
-            ? `已取消 task=${task.taskId}`
-            : `执行失败 task=${task.taskId}\n\n${truncateText([task.output, task.error !== task.output ? task.error : ""].filter(Boolean).join("\n\n") || "unknown error")}`;
-      try {
-        const desktopNote = task.desktopName ? `\nCodex 客户端会话：${task.desktopName}` : "";
-        await this.publishTaskText(task, `${finalText}${desktopNote}`, { rotateOnAnyUpdateError: true });
-      } catch (error) {
-        log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) });
-      }
+      const finalText = task.status === "success" ? `${truncateText(task.output || "任务已完成。")}${imageDeliveryNote}`
+        : task.status === "interrupted" ? `${truncateText(task.output || "当前任务已停止。")}`
+        : task.status === "cancelled" ? "这条任务已取消排队。"
+        : `执行未完成\n${truncateText([task.output, task.error !== task.output ? task.error : ""].filter(Boolean).join("\n\n") || "请重试。")}`;
+      try { await this.publishTaskText(task, finalText, { rotateOnAnyUpdateError: true }); }
+      catch (error) { log("warn", "failed to send final message", { taskId: task.taskId, error: String(error) }); }
       if (imageDownloadPath) rmSync(imageDownloadPath, { force: true });
       if (task.imagePath) rmSync(task.imagePath, { force: true });
       log("info", "task finished", { taskId: task.taskId, status: task.status, seconds });
@@ -1464,6 +1343,7 @@ class TaskRunner {
     }
     const child = this.activeTasks.get(taskId);
     if (!child) return;
+    if (child.interrupt && !child.cancel && !child.kill) { this.activeTasks.delete(taskId); return; }
     if (child.canCancel === false) {
       this.activeTasks.delete(taskId);
       return;
@@ -1498,9 +1378,9 @@ const runner = new TaskRunner(messenger);
 const allowedUserIds = new Set(config.bridge.allowedUserIds);
 let pairingCode = allowedUserIds.size === 0 ? makePairingCode() : null;
 
-async function showControlCard(chatId, replyToMessageId, notice = "") {
-  const projectPath = runner.activeProjectPath(chatId);
-  const card = buildControlCard(runner, chatId, projectPath, notice);
+async function showControlCard(chatId, replyToMessageId, notice = "", view = "home", page = 0, scope = {}) {
+  const projectPath = scope.projectPath || runner.activeProjectPath(chatId);
+  const card = buildControlCard(runner, chatId, projectPath, notice, view, page, scope.sessionName);
   const messageId = await messenger.replyCard(replyToMessageId, card);
   if (messageId) runner.setControlCardMessageId(chatId, messageId);
   return messageId;
@@ -1681,9 +1561,30 @@ async function handleMessage(message) {
     await messenger.replyText(message.messageId, parts.join("\n\n"));
     return;
   }
-  if (command.type === "cancel") {
-    const ok = runner.cancelTask(command.taskId);
-    await messenger.replyText(message.messageId, ok ? "已取消。" : runner.cancelFailureMessage(command.taskId));
+  if (["stop", "cancel"].includes(command.type)) {
+    let notice;
+    try {
+      const taskId = command.taskId || runner.currentTask(message.chatId, activeProjectPath)?.taskId;
+      notice = taskId ? runner.stopTask(taskId, { chatId: message.chatId, senderId: message.senderId }).notice : "当前会话没有正在执行的任务。";
+    } catch (error) { notice = error.message; }
+    await messenger.replyText(message.messageId, notice);
+    return;
+  }
+  if (command.type === "queue") {
+    await showControlCard(message.chatId, message.messageId, "", "queue");
+    return;
+  }
+  if (command.type === "resume") {
+    try {
+      const name = runner.activeSessionName(message.chatId, activeProjectPath);
+      const target = command.taskId || [...runner.tasks.values()].reverse().find(t => t.source.chatId === message.chatId && t.projectPath === activeProjectPath && t.sessionName === name && t.status === "interrupted" && !t.resumedAs)?.taskId;
+      if (!target && message.text.trim() === "继续") {
+        await runner.create(message, activeProjectPath, "继续", name);
+        return;
+      }
+      if (!target) throw new Error("当前会话没有已停止的任务，直接发送新要求即可开始。");
+      await runner.resumeTask(target, message);
+    } catch (error) { await messenger.replyText(message.messageId, error.message); }
     return;
   }
   if (command.type === "steer") {
@@ -1693,7 +1594,7 @@ async function handleMessage(message) {
         ? await runner.steering.promote(command.taskId, { chatId: message.chatId, senderId: message.senderId })
         : await runner.steering.submit(runner.steering.active(message.chatId, activeProjectPath,
           runner.activeSessionName(message.chatId, activeProjectPath)), command.prompt);
-      notice = `已提交引导，task=${result.targetTaskId}；当前任务继续运行。`;
+      notice = "已提交引导，当前任务会按补充要求继续。";
       if (command.taskId) {
         try { await runner.publishTaskText(runner.tasks.get(command.taskId), notice); }
         catch (error) { log("warn", "failed to update steering receipt", { error: String(error) }); }
@@ -1784,7 +1685,7 @@ async function handleNormalizedCardAction(event) {
       const result = await runner.steering.promote(value.taskId, {
         chatId: actionChatId, senderId: event.operator.openId, messageId: event.messageId,
       });
-      notice = `已提交引导，task=${result.targetTaskId}；当前任务继续运行。`;
+      notice = "已提交引导，当前任务会按补充要求继续。";
       try { await runner.publishTaskText(task, notice); }
       catch (error) { log("warn", "failed to update steering receipt", { error: String(error) }); }
     } catch (error) {
@@ -1793,8 +1694,33 @@ async function handleNormalizedCardAction(event) {
         : `引导未提交：${error.message}`;
     }
     if (task?.steerCardMessageId === event.messageId && task.source.chatId === actionChatId && task.source.senderId === event.operator.openId) {
-      await messenger.updateCard(event.messageId, buildSteeringCard(task, notice));
+      await runner.publishTaskText(task, notice);
     }
+    return;
+  }
+  if (["stop_task", "cancel_task", "resume_task"].includes(value.action)) {
+    const task = runner.tasks.get(value.taskId);
+    const ownTaskCard = task?.statusMessageId === event.messageId;
+    const currentPanel = runner.controlCardMessageId(actionChatId) === event.messageId;
+    if (!task || (!ownTaskCard && !currentPanel) || (event.chatId && event.chatId !== actionChatId)) return;
+    let notice;
+    try {
+      if (value.action === "resume_task") {
+        if (value.generation !== task.generation) throw new Error("任务卡片已失效。");
+        await runner.resumeTask(task.taskId, { chatId: actionChatId, senderId: event.operator.openId, messageId: event.messageId });
+        notice = "已开始继续任务。";
+      } else notice = runner.stopTask(task.taskId, { chatId: actionChatId, senderId: event.operator.openId,
+        generation: value.generation, messageId: ownTaskCard ? event.messageId : undefined }).notice;
+    } catch (error) { notice = error.message; }
+    if (currentPanel) await messenger.updateCard(event.messageId, buildControlCard(runner, actionChatId, cardProjectPath, notice,
+      value.view === "queue" ? "queue" : "home", value.page, value.sessionName));
+    else if (notice && task.source.chatId === actionChatId && task.source.senderId === event.operator.openId) await runner.publishTaskText(task, notice);
+    return;
+  }
+  if (value.action === "show_queue" && value.taskId) {
+    const task = runner.tasks.get(value.taskId);
+    if (!task || task.statusMessageId !== event.messageId || task.source.chatId !== actionChatId || task.source.senderId !== event.operator.openId) return;
+    await showControlCard(actionChatId, event.messageId, "", "queue", 0, { projectPath: task.projectPath, sessionName: task.sessionName });
     return;
   }
   const currentCardMessageId = runner.controlCardMessageId(actionChatId);
@@ -1818,14 +1744,27 @@ async function handleNormalizedCardAction(event) {
   if (shouldRefreshProjectChoicesForCardAction(value.action)) {
     await refreshProjectChoices(`card:${value.action}`);
   }
-  const projectPath = cardProjectPathForAction({
+  const projectPath = value.view === "queue" ? cardProjectPath : cardProjectPathForAction({
     activeProjectPath: runner.activeProjectPath(actionChatId),
     cardProjectPath,
     defaultProjectPath: config.bridge.defaultProjectPath,
   });
+  const controlSession = value.sessionName || runner.activeSessionName(actionChatId, projectPath);
+  let view = ["home", "projects", "sessions", "settings", "models", "reasoning", "queue"].includes(value.view) ? value.view : "home";
   let notice = "";
-  if (value.action === "refresh" || value.action === "show_sessions") {
+  if (["show_home", "show_projects", "show_sessions", "show_settings", "show_models", "show_reasoning", "show_queue"].includes(value.action)) {
+    view = value.action.slice(5);
+  } else if (value.action === "resume_queue") {
+    runner.queue.resume(sessionKey(actionChatId, projectPath, controlSession));
+    view = "queue";
+    notice = "待办将按顺序执行。";
+  } else if (value.action === "refresh") {
     notice = "已刷新";
+  } else if (value.action === "reset_settings") {
+    runner.clearModelOverride(actionChatId, projectPath);
+    runner.clearReasoningOverride(actionChatId, projectPath);
+    view = "settings";
+    notice = "已恢复默认配置。";
   } else if (value.action === "set_project") {
     const targetProjectPath = typeof value.targetProjectPath === "string" ? value.targetProjectPath : "";
     const resolved = runner.resolveProjectSelection(targetProjectPath);
@@ -1840,6 +1779,7 @@ async function handleNormalizedCardAction(event) {
     const validation = validateModelName(value.model);
     if (validation.ok) {
       runner.setModelOverride(actionChatId, projectPath, validation.model);
+      view = "settings";
       notice = `已切换模型为 ${validation.model}`;
     } else {
       notice = `模型无效: ${validation.reason}`;
@@ -1851,6 +1791,7 @@ async function handleNormalizedCardAction(event) {
     const validation = validateReasoningEffort(value.reasoningEffort);
     if (validation.ok) {
       runner.setReasoningOverride(actionChatId, projectPath, validation.effort);
+      view = "settings";
       notice = `已切换推理强度为 ${validation.effort}`;
     } else {
       notice = `推理强度无效: ${validation.reason}`;
@@ -1860,29 +1801,29 @@ async function handleNormalizedCardAction(event) {
     notice = existed ? "已清除推理强度覆盖" : "当前没有推理强度覆盖";
   } else if (value.action === "use_session") {
     const sessionName = runner.setActiveSession(actionChatId, projectPath, value.sessionName);
-    notice = `已切换到 session=${sessionName}`;
+    notice = `已切换到 ${sessionName === "default" ? "默认会话" : sessionName}`;
+    view = "home";
   } else if (value.action === "new_session") {
+    const existingNames = new Set(runner.sessionStates(actionChatId, projectPath).map(item => item.name));
+    let number = 1;
+    while (existingNames.has(`会话${number}`)) number++;
     const sessionName = runner.setActiveSession(
       actionChatId,
       projectPath,
-      `session-${new Date().toISOString().slice(11, 19).replace(/:/g, "")}`
+      `会话${number}`
     );
-    notice = `已新建并切换到 session=${sessionName}`;
+    notice = "新会话已准备好，直接发送消息即可。";
+    view = "home";
   } else if (value.action === "reset_active_session") {
     const activeName = runner.activeSessionName(actionChatId, projectPath);
     const result = runner.resetSession(actionChatId, projectPath, activeName);
-    notice = result.existed
-      ? `已重置 session=${result.sessionName}`
-      : `当前 session=${result.sessionName} 尚无映射，已保持为 active`;
-  } else if (value.action === "cancel_task") {
-    const taskId = typeof value.taskId === "string" ? value.taskId : "";
-    const ok = taskId ? runner.cancelTask(taskId) : false;
-    notice = ok ? `已取消 task=${taskId}` : runner.cancelFailureMessage(taskId);
+    notice = result.existed ? "已重置会话，下一条消息会开启新上下文。" : "会话已准备好，直接发送消息即可。";
   } else {
     notice = `未知动作: ${value.action}`;
   }
 
-  await messenger.updateCard(event.messageId, buildControlCard(runner, actionChatId, projectPath, notice));
+  await messenger.updateCard(event.messageId, buildControlCard(runner, actionChatId, projectPath, notice, view, value.page,
+    view === "queue" ? controlSession : null));
 }
 
 const dispatcher = new EventDispatcher({}).register({
@@ -1942,6 +1883,8 @@ log("info", "starting Feishu Codex bridge", {
   codexCommand: codexLauncher.command,
   sessionBackend: APP_SERVER_SESSION_BACKEND,
   taskTransport: config.codex.transport,
+  cardLayout: "compact-v1",
+  taskControl: "interrupt-v1",
 });
 await wsClient.start({ eventDispatcher: dispatcher });
 log("info", "Feishu WebSocket connected; waiting for messages");
