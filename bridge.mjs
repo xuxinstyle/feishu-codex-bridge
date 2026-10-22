@@ -41,6 +41,8 @@ import { uploadAndSendFeishuImage } from "./feishu-media.mjs";
 import { SessionTaskQueue } from "./task-queue.mjs";
 import { TaskInterruption } from "./task-interruption.mjs";
 import { buildPanelCard, buildTaskCard } from "./feishu-cards.mjs";
+import { createHistoryReader } from "./codex-history.mjs";
+import { HistoryBrowser } from "./history-browser.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
 const HOME_CONFIG_PATH = path.join(HOME_CONFIG_DIR, "config.env");
@@ -469,6 +471,7 @@ function getHelpMessage() {
     "- 连续发送多个任务会排队执行，不会自动取消前一个任务",
     "- 排队文字消息可点击「引导」提交给当前任务，不中断运行；也可发送 /steer 补充要求",
     "- /sessions：查看当前仓库的 Codex session",
+    "- /threads：在私聊中只读查看当前项目其他 Codex 会话及聊天记录",
     "- /use <名字>：切换当前聊天窗口的 active session",
     "- /new <名字>：新建/重置命名 session 并切换过去",
     "- /new：清除当前 active session 映射",
@@ -1419,11 +1422,41 @@ async function handleMessage(message) {
     return;
   }
 
+  // History is more sensitive than the task controls: require an explicitly
+  // authorized actor and a confirmed private inbound conversation.
+  if (allowedUserIds.has(message.senderId) && message.chatType === "p2p") {
+    historyChatOwners.set(message.chatId, message.senderId);
+    if (historyChatOwners.size > 256) historyChatOwners.delete(historyChatOwners.keys().next().value);
+  }
+
   const command = message.imageKey
     ? { type: "run", prompt: message.text || "请分析这张图片并回答。" }
     : parseCommand(message.text);
   if (command.type === "help") {
     await messenger.replyText(message.messageId, getHelpMessage());
+    return;
+  }
+  if (command.type === "history") {
+    if (message.chatType !== "p2p" || !historyAllowed(message.chatId, message.senderId)) {
+      await messenger.replyText(message.messageId, "请在已配对的机器人私聊中发送 /threads 查看本地会话。");
+      return;
+    }
+    if (command.invalidArgs) {
+      await messenger.replyText(message.messageId, "请直接发送 /threads 查看列表，再点击会话查看内容。");
+      return;
+    }
+    const messageId = await showControlCard(message.chatId, message.messageId, "正在读取本地会话…");
+    if (!messageId) return;
+    const revision = historyCardRevisions.get(messageId) || 0;
+    const scope = historyScope(message.chatId, message.senderId, messageId);
+    try {
+      const card = await getHistoryBrowser().open(scope);
+      await deliverHistoryCard(scope, revision, card);
+    } catch (error) {
+      log("warn", "local history request failed", { error: String(error) });
+      await deliverHistoryCard(scope, revision, buildControlCard(runner, message.chatId, scope.projectPath,
+        "本地会话读取未完成，请点击本地会话重试。"));
+    }
     return;
   }
   if (command.type === "panel") {
@@ -1641,17 +1674,80 @@ async function handleMessage(message) {
   log("info", "task queued", { taskId: task.taskId, projectPath, sessionName: task.sessionName });
 }
 
+const historyChatOwners = new Map();
+let historyBrowser;
+function historyAllowed(chatId, senderId) {
+  return allowedUserIds.has(senderId) && historyChatOwners.get(chatId) === senderId;
+}
+function historyScope(chatId, ownerId, panelId) {
+  return { chatId, ownerId, panelId, projectPath: runner.activeProjectPath(chatId) };
+}
+function getHistoryBrowser() {
+  return historyBrowser ||= new HistoryBrowser({ reader: createHistoryReader({
+    command: codexLauncher.command, argsPrefix: codexLauncher.argsPrefix, shell: codexLauncher.shell,
+    cwd: config.bridge.defaultProjectPath, env: { ...process.env, CODEX_HOME: codexHome }, timeoutMs: 15_000,
+  }) });
+}
+
+const historyCardRevisions = new Map();
+const historyActions = new Set(["show_history", "show_history_thread", "show_history_text", "show_history_refresh", "show_history_batch"]);
+
 const executeCardActionSerially = createKeyedSerialExecutor();
 
+function nextHistoryRevision(messageId) {
+  const revision = (historyCardRevisions.get(messageId) || 0) + 1;
+  historyCardRevisions.set(messageId, revision);
+  if (historyCardRevisions.size > 256) historyCardRevisions.delete(historyCardRevisions.keys().next().value);
+  return revision;
+}
+
 async function handleCardAction(raw) {
-  const event = normalizeCardAction(raw, { includeRaw: true });
+  const event = normalizeCardAction(raw?.event || raw, { includeRaw: true });
   if (!event) {
     log("warn", "ignored unrecognized card action", {
       keys: raw && typeof raw === "object" ? Object.keys(raw) : [],
     });
     return;
   }
+  const value = parseCardActionValue(event.action?.value);
+  const trusted = value?.bridge === CARD_BRIDGE_ID && value.scopeChatId === event.chatId &&
+    allowedUserIds.has(event.operator.openId);
+  if (historyActions.has(value?.action)) {
+    if (value.bridge !== CARD_BRIDGE_ID || value.scopeChatId !== event.chatId ||
+        !historyAllowed(event.chatId, event.operator.openId)) {
+      return { toast: { type: "error", content: "请在已配对的机器人私聊中发送 /threads。" } };
+    }
+    if (!event.messageId || runner.controlCardMessageId(event.chatId) !== event.messageId) {
+      return { toast: { type: "warning", content: "页面已过期，请发送 /threads 重新打开。" } };
+    }
+    const revision = nextHistoryRevision(event.messageId);
+    void handleHistoryCardAction(event, value, revision).catch(error => log("warn", "local history delivery failed", { error: String(error) }));
+    return { toast: { type: "info", content: "正在读取本地会话…" } };
+  }
+  if (trusted) nextHistoryRevision(event.messageId);
   return executeCardActionSerially(event.messageId, () => handleNormalizedCardAction(event));
+}
+
+async function handleHistoryCardAction(event, value, revision) {
+  const scope = historyScope(event.chatId, event.operator.openId, event.messageId);
+  let card;
+  try {
+    const browser = getHistoryBrowser();
+    card = value.action === "show_history" ? await browser.open(scope) : await browser.act(value, scope);
+  } catch (error) {
+    log("warn", "local history request failed", { error: String(error) });
+    card = buildControlCard(runner, event.chatId, scope.projectPath,
+      "本地会话读取未完成，页面可能已过期或接口暂不可用。请点击本地会话重试。");
+  }
+  await deliverHistoryCard(scope, revision, card);
+}
+
+async function deliverHistoryCard(scope, revision, card) {
+  return executeCardActionSerially(scope.panelId, async () => {
+    if (!historyAllowed(scope.chatId, scope.ownerId) || runner.controlCardMessageId(scope.chatId) !== scope.panelId ||
+        (historyCardRevisions.get(scope.panelId) || 0) !== revision || runner.activeProjectPath(scope.chatId) !== scope.projectPath) return;
+    await messenger.updateCard(scope.panelId, card);
+  });
 }
 
 async function handleNormalizedCardAction(event) {
@@ -1862,7 +1958,7 @@ const dispatcher = new EventDispatcher({}).register({
     });
     const raw = data?.event ? data.event : data;
     try {
-      await handleCardAction(raw);
+      return await handleCardAction(raw);
     } catch (error) {
       log("error", "card action handler failed", { error: String(error) });
     }

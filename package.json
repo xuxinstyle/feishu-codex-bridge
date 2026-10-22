@@ -9,7 +9,8 @@
     "check": "node --check bridge.mjs",
     "test": "node --test",
     "preview:cards": "node scripts/preview-cards.mjs --serve",
-    "test:live": "node scripts/verify-task-resume.mjs"
+    "test:live": "node scripts/verify-task-resume.mjs",
+    "test:history:live": "node scripts/verify-history.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.1.1"

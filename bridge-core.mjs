@@ -9,6 +9,9 @@ export function parseCommand(text) {
   if (trimmed === "/sessions" || trimmed === "/session" || trimmed === "会话列表") {
     return { type: "sessions" };
   }
+  if (/^\/(?:threads|history)(?:\s|$)/i.test(trimmed) || ["本地会话", "聊天记录"].includes(trimmed)) {
+    return { type: "history", invalidArgs: /^\/(?:threads|history)\s+\S/i.test(trimmed) };
+  }
 
   const modelMatch = trimmed.match(/^\/(?:model|模型)(?:\s+(.+))?$/i);
   if (modelMatch) {

@@ -85,6 +85,7 @@ tool/feishu-codex-bridge/start.ps1
 | `/steer <补充要求>` / `/引导 <补充要求>` | 直接向当前项目、当前 session 的运行中任务追加文字要求 |
 | `/steer task-xxxx` | 将指定的排队文字消息作为引导提交 |
 | `/sessions` | 查看当前项目的 session 列表 |
+| `/threads` / `/history` / `本地会话` | 在机器人私聊中只读查看当前项目其他 Codex 会话及聊天记录 |
 | `/use <名字>` | 切换当前聊天窗口的 active session |
 | `/new <名字>` | 新建/重置命名 session 并切换过去 |
 | `/new` | 清除当前 active session 映射 |
@@ -172,6 +173,11 @@ Session 示例：
 桥接进程会在启动后、打开或查看项目面板时，以及后台刷新时执行发现。查询使用 `thread/list` 的 `useStateDbOnly: true`，只读取 Codex 已保存的会话索引，避免每页扫描与修复历史文件导致超时。App Server 不可用时会记录 warning，并保留上次成功的项目列表（启动时为手工配置），不影响桥接启动和任务执行。
 
 ## 注意
+
+- 私聊发送 `/threads`，或点击 `/panel` 的“本地会话”，可查看当前项目下由客户端、CLI 等发起的其他会话。列表按最近更新排序，点击会话后显示用户消息及 Codex 回复；支持更早记录、较新记录、长回复分段和刷新。只读浏览不会切换飞书当前执行会话，直接发送消息仍提交给原飞书会话。
+- 历史浏览仅允许已配对或在 `ALLOWED_USER_IDS` 中的用户私聊使用，群聊不展示个人历史。进程重启后先在私聊发送 `/threads` 重新打开；页面内存令牌有效期 15 分钟。只读取相同 `CODEX_HOME` 的本机已保存、未归档会话；按会话 cwd 精确匹配当前项目，工作树或子目录需切换到对应目录。隐藏 `[飞书]` 标题及 subagent 会话，不显示工具输出、推理和附件。正在运行的内容以最近保存的历史为准，可点击刷新。
+- 历史通过 `thread/list`、`thread/read` 和 `thread/turns/list` 读取，不恢复会话、不新建模型轮次；需本机 Codex 支持历史分页接口，旧版不回退到全量历史读取。[官方读取接口说明](https://learn.chatgpt.com/docs/app-server#read-a-stored-thread-without-resuming)
+- 本地真实历史验证：`npm run test:history:live -- <已有会话的项目绝对路径>`。通过正式消息和卡片处理器读取本机真实历史，验证翻页、刷新、私聊限制和会话映射不变；飞书信使仅在内存中记录卡片，不向外发送测试消息。结果写入 `outputs/history-verification/result.json`，不保存聊天正文。
 
 - 新的飞书任务会创建标题为 `[飞书] 项目目录名 · session名` 的 Codex 会话，后续同一 session 继续使用同一条历史；最终飞书回复也会提示对应的客户端会话名称。
 - 默认桌面通道会自动发现本机 Codex 客户端的连接，客户端重启后无需重新配置。未打开客户端时会明确提示，不会悄悄转到独立执行进程。

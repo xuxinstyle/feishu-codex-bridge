@@ -105,6 +105,7 @@ export function buildPanelCard(state) {
     task?.stopError ? note("停止结果尚未确认，可重试或在客户端检查。") : null,
     state.paused && state.queued?.length ? note("旧待办仍暂停，可在待办中恢复。") : null,
     ...rows(actions), { tag: "hr" }, row([btn("切换项目", "show_projects"), btn("切换会话", "show_sessions")]),
+    row([btn("本地会话", "show_history")]),
     row([btn("设置", "show_settings"), btn("刷新", "refresh")]),
   ]);
 }
