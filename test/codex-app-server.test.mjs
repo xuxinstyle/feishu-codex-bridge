@@ -95,6 +95,89 @@ test("follow-up tasks resume the same thread and ignore notifications from other
   assert.equal(f.requests.find(r => r.method === "turn/start").params.effort, "high");
 });
 
+test("continuation verifies the latest interrupted turn before submitting minimal input", async () => {
+  const submissions = [];
+  const f = setup({ onRequest: (r, p) => {
+    if (r.method !== "thread/read") return false;
+    assert.equal(r.params.includeTurns, true);
+    p.reply(r, { thread: { status: { type: "idle" }, turns: [{ id: "older-turn", status: "completed" }, { id: "stopped-turn", status: "interrupted" }] } });
+    return true;
+  }, onTurn: p => complete(p) });
+  await runAppServerTask({ ...f.options, threadId: "thread-a", expectedTurnId: "stopped-turn", prompt: "继续", onSubmission: state => submissions.push(state) });
+  assert.deepEqual(submissions, ["submitting", "submitted"]);
+  assert.equal(f.requests.find(r => r.method === "turn/start").params.input[0].text, "继续");
+  assert.ok(!f.requests.some(r => r.method === "thread/start"));
+});
+
+test("continuation refuses unreadable, missing, replaced, or unfinished turn history", async () => {
+  for (const history of [
+    null,
+    {},
+    { thread: { turns: [] } },
+    { thread: { turns: [{ id: "stopped-turn", status: "interrupted" }, { id: "new-turn", status: "completed" }] } },
+    { thread: { turns: [{ id: "stopped-turn", status: "completed" }] } },
+    { thread: { turns: [{ id: "stopped-turn", status: "inProgress" }] } },
+    { thread: { status: { type: "active" }, turns: [{ id: "stopped-turn", status: "interrupted" }] } },
+  ]) {
+    const submissions = [];
+    const f = setup({ onRequest: (r, p) => {
+      if (r.method !== "thread/read") return false;
+      if (history === null) p.send({ id: r.id, error: { code: -32603, message: "history unavailable" } });
+      else p.reply(r, history);
+      return true;
+    } });
+    await assert.rejects(runAppServerTask({ ...f.options, threadId: "thread-a", expectedTurnId: "stopped-turn", onSubmission: state => submissions.push(state) }), /会话已有新内容或原轮次未停止/);
+    assert.ok(!f.requests.some(r => ["turn/start", "thread/start"].includes(r.method)));
+    assert.deepEqual(submissions, []);
+  }
+});
+
+test("App Server continuation restores only missing steering before the minimal continuation input", async () => {
+  const f = setup({ onRequest: (r, p) => {
+    if (r.method !== "thread/read") return false;
+    p.reply(r, { thread: { turns: [{ id: "stopped-turn", status: "interrupted", items: [
+      { type: "userMessage", content: [{ type: "text", text: "原任务" }] },
+      { type: "userMessage", clientId: "already", content: [{ type: "text", text: "已消费" }] },
+    ] }] } });
+    return true;
+  }, onTurn: p => complete(p) });
+  await runAppServerTask({ ...f.options, threadId: "thread-a", expectedTurnId: "stopped-turn", prompt: "继续", expectedInitialInputKind: "userMessage",
+    continuationInputs: [{ id: "already", prompt: "已消费" }, { id: "missing", prompt: "未消费原文" }],
+  });
+  assert.deepEqual(f.requests.find(r => r.method === "turn/start").params.input.map(part => part.text), ["未消费原文", "继续"]);
+});
+
+test("continuation without a thread fails before spawning a new history writer", async () => {
+  const f = setup({ onSpawn: () => assert.fail("must not spawn") });
+  await assert.rejects(runAppServerTask({ ...f.options, expectedTurnId: "stopped-turn" }), /会话已有新内容或原轮次未停止/);
+  assert.deepEqual(f.requests, []);
+});
+
+test("stop before submission does not report any submission state", async () => {
+  let control;
+  const submissions = [];
+  const f = setup();
+  const result = await runAppServerTask({ ...f.options, onControl: value => { if (value) control = value; }, onThread: () => control.interrupt(), onSubmission: state => submissions.push(state) });
+  assert.equal(result.turn.status, "interrupted");
+  assert.deepEqual(submissions, []);
+  assert.ok(!f.requests.some(r => r.method === "turn/start"));
+});
+
+test("turn-start notification confirms submission once even before its request response", async () => {
+  const submissions = [];
+  const f = setup({ onRequest: (r, p) => {
+    if (r.method !== "turn/start") return false;
+    assert.deepEqual(submissions, ["submitting"]);
+    p.notify("turn/started", { turn: { id: "turn-a" } });
+    assert.deepEqual(submissions, ["submitting", "submitted"]);
+    p.reply(r, { turn: { id: "turn-a" } });
+    complete(p);
+    return true;
+  } });
+  await runAppServerTask({ ...f.options, onSubmission: state => submissions.push(state) });
+  assert.deepEqual(submissions, ["submitting", "submitted"]);
+});
+
 test("turn failure rejects even when partial output was emitted", async () => {
   const f = setup({ onTurn: p => complete(p, "部分内容", "failed", { message: "provider unavailable" }) });
   await assert.rejects(runAppServerTask(f.options), /provider unavailable/);

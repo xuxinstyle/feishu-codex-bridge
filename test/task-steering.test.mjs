@@ -28,6 +28,7 @@ test("promotion holds the queue and duplicate clicks share one delivery", async 
   assert.equal(f.target.status, "running");
   assert.equal((await f.steering.promote("task-b", f.scope)).alreadySubmitted, true);
   assert.equal(calls, 1);
+  assert.deepEqual(f.target.steeringInputs, [{ id: "task-a:steer:1", prompt: "先完成测试" }]);
 });
 
 test("known rejection releases the message to normal queue execution", async () => {
@@ -45,6 +46,8 @@ test("unknown delivery never automatically runs the queued prompt again", async 
   await assert.rejects(f.steering.promote("task-b", f.scope), /lost acknowledgement/);
   assert.equal(await f.steering.claimForRun(f.queued), false);
   assert.equal(f.queued.status, "steer_unknown");
+  assert.equal(f.target.steeringUncertain, true);
+  assert.equal(f.target.steeringInputs, undefined);
 });
 
 test("old cards cannot steer a new running task after the original completes", async () => {
@@ -80,6 +83,35 @@ test("direct steering is scoped and serial, without adding a queued task", async
   assert.deepEqual(order, ["一", "二"]);
   assert.equal(f.tasks.size, 2);
   assert.equal(active.steerCount, 2);
+  assert.deepEqual(active.steeringInputs, [{ id: "task-a:steer:1", prompt: "一" }, { id: "task-a:steer:2", prompt: "二" }]);
+});
+
+test("steering tracks pending receipts synchronously and records the acknowledged native input identity once", async () => {
+  let acknowledge;
+  const gate = new Promise(resolve => { acknowledge = resolve; });
+  const f = fixture(() => gate);
+  const submission = f.steering.submit(f.target, "保留这条补充要求");
+  assert.equal(f.target.steeringOperations.size, 1, "Resume must be able to observe the operation before the native call yields");
+  assert.ok(f.target.steeringOperations.has(submission));
+  assert.equal(f.target.steeringInputs, undefined);
+  await new Promise(resolve => setImmediate(resolve));
+  f.target.status = "interrupted";
+  acknowledge({ turnId: "turn-a", clientUserMessageId: "native-input-id" });
+  await submission;
+  assert.deepEqual(f.target.steeringInputs, [{ id: "native-input-id", prompt: "保留这条补充要求" }]);
+  assert.equal(f.target.steerCount, 1);
+  assert.equal(f.target.steeringOperations.size, 0);
+});
+
+test("known steering rejection settles tracking without recording an input or marking delivery uncertain", async () => {
+  const f = fixture(async () => { throw new Error("Rejected before delivery"); });
+  const submission = f.steering.submit(f.target, "没有被接收的要求");
+  assert.equal(f.target.steeringOperations.size, 1);
+  await assert.rejects(submission, /Rejected before delivery/);
+  assert.equal(f.target.steeringOperations.size, 0);
+  assert.equal(f.target.steeringInputs, undefined);
+  assert.ok(!f.target.steeringUncertain);
+  assert.equal(f.target.steerCount, undefined);
 });
 
 test("empty input and unready tasks are rejected without queue changes", async () => {

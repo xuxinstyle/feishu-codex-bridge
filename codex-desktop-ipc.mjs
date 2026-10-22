@@ -93,7 +93,57 @@ export class DesktopSessionControl {
 
   async findOwner(threadId) {
     const result = await this.request("thread-owner-discovery", { hostId: "local", conversationId: threadId }, { version: 1 });
+    if (!result.handledByClientId) throw new Error("Codex 客户端尚未加载这条会话，请在客户端打开后重试。");
     return result.handledByClientId;
+  }
+
+  async start(threadId, { prompt, textInputs = [], imagePath, model, effort, clientUserMessageId = randomUUID(), onSubmission = () => {} } = {}) {
+    if (!threadId || !prompt?.trim()) throw new Error("提交任务需要明确的会话和消息内容");
+    let owner;
+    try { owner = await this.findOwner(threadId); }
+    catch (error) {
+      if (/no-client-found/.test(error.message)) throw new Error("Codex 客户端尚未加载这条会话，请在客户端打开后重试。");
+      throw error;
+    }
+    if (!Array.isArray(textInputs) || textInputs.some(text => typeof text !== "string" || !text.trim())) throw new Error("待恢复的补充要求格式无效");
+    const input = [...textInputs, prompt].map(text => ({ type: "text", text, text_elements: [] }));
+    if (imagePath) input.push({ type: "localImage", path: imagePath });
+    // Local Desktop owns the history writer and starts a real user turn.
+    // useUserMessageAdmission is cloud-only; local owners use turn/start.
+    onSubmission("submitting");
+    const response = await this.request("thread-follower-start-turn", {
+      conversationId: threadId,
+      turnStart: {
+        request: { threadId, input, clientUserMessageId, ...(model ? { model } : {}), ...(effort ? { effort } : {}) },
+        context: { inheritThreadSettings: true },
+      },
+    }, { version: 2, targetClientId: owner });
+    const result = response.result?.result;
+    if (!result?.turn?.id) {
+      throw Object.assign(new Error("客户端未确认用户消息已保存，请在客户端核对后再继续。"), { submissionOutcomeUnknown: true });
+    }
+    onSubmission("submitted");
+    return result;
+  }
+
+  async steer(threadId, turnId, options) {
+    const { prompt, cwd, clientUserMessageId = randomUUID() } = options || {};
+    if (!threadId || !turnId || !prompt?.trim()) throw new Error("补充要求需要明确的会话、执行轮次和消息内容");
+    const owner = await this.findOwner(threadId);
+    // Match Desktop's own restore-message envelope; toolOutput must be absent
+    // so the owner sends turn/steer rather than queues a delegated turn/start.
+    const restoreMessage = { id: clientUserMessageId, text: prompt, createdAt: Date.now(), ...(cwd ? { cwd } : {}),
+      context: { prompt, addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [], workspaceRoots: cwd ? [cwd] : [] },
+    };
+    const response = await this.request("thread-follower-steer-turn", {
+      conversationId: threadId, clientUserMessageId,
+      input: [{ type: "text", text: prompt, text_elements: [] }], restoreMessage, attachments: [],
+    }, { version: 1, targetClientId: owner });
+    const result = response.result?.result;
+    if (result?.turnId !== turnId) {
+      throw Object.assign(new Error("客户端未确认补充要求进入目标轮次，请在客户端核对。"), { steerOutcomeUnknown: true });
+    }
+    return { turnId, clientUserMessageId };
   }
 
   async interrupt(threadId, turnId) {
@@ -127,5 +177,21 @@ export async function interruptDesktopTurn(threadId, turnId, options) {
   try {
     await control.initialize();
     return await control.interrupt(threadId, turnId);
+  } finally { control.close(); }
+}
+
+export async function startDesktopTurn(threadId, submission, options) {
+  const control = new DesktopSessionControl(options);
+  try {
+    await control.initialize();
+    return await control.start(threadId, submission);
+  } finally { control.close(); }
+}
+
+export async function steerDesktopTurn(threadId, turnId, submission, options) {
+  const control = new DesktopSessionControl(options);
+  try {
+    await control.initialize();
+    return await control.steer(threadId, turnId, submission);
   } finally { control.close(); }
 }

@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node bridge.mjs",
     "check": "node --check bridge.mjs",
-    "test": "node --test",
+    "test": "node --test test/*.test.mjs",
     "preview:cards": "node scripts/preview-cards.mjs --serve",
     "test:live": "node scripts/verify-task-resume.mjs",
     "test:history:live": "node scripts/verify-history.mjs"

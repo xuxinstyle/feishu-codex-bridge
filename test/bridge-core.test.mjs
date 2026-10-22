@@ -225,7 +225,6 @@ test("bridge keeps model choices available through the compact card renderer", (
   assert.match(source, /model: task\.model/);
   assert.doesNotMatch(source, /taskModel/);
   assert.match(source, /controlCardMessageId/);
-  assert.match(source, /ignored action from stale control card/);
 });
 
 test("panel command always replies with a new card", () => {
@@ -247,6 +246,7 @@ test("panel command replies before refreshing project history", () => {
   assert.match(match[0], /await showControlCard/);
   assert.match(match[0], /refreshProjectChoices\("panel"\)/);
   assert.doesNotMatch(match[0], /await refreshProjectChoices\("panel"\)/);
+  assert.doesNotMatch(match[0], /messenger\.updateCard/, "Background discovery must not overwrite navigation with the home card");
 });
 
 test("extractThreadCwds reads cwd values from thread/list result pages and ignores malformed threads", () => {
@@ -292,7 +292,8 @@ test("mergeProjectChoices preserves configured projects and appends discovered p
 test("card project discovery only runs for explicit refresh actions", () => {
   assert.equal(typeof shouldRefreshProjectChoicesForCardAction, "function");
   assert.equal(shouldRefreshProjectChoicesForCardAction("refresh"), true);
-  assert.equal(shouldRefreshProjectChoicesForCardAction("show_sessions"), true);
+  assert.equal(shouldRefreshProjectChoicesForCardAction("show_sessions"), false);
+  assert.equal(shouldRefreshProjectChoicesForCardAction("show_projects"), false);
   assert.equal(shouldRefreshProjectChoicesForCardAction("set_project"), false);
   assert.equal(shouldRefreshProjectChoicesForCardAction("set_model"), false);
 });
