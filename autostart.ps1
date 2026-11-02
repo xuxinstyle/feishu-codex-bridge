@@ -58,6 +58,7 @@ switch ($Action) {
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
             -StartWhenAvailable `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -RestartCount 10 `
             -RestartInterval (New-TimeSpan -Minutes 1) `
             -MultipleInstances IgnoreNew
