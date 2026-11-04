@@ -6,6 +6,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { TurnInterrupt } from "./turn-interrupt.mjs";
 import { missingSteeringInputs } from "./steering-context.mjs";
+import { resolveSessionEnv } from "./codex-home.mjs";
 
 export const APP_SERVER_SESSION_BACKEND = "app-server-v1";
 
@@ -157,6 +158,7 @@ export class CodexAppServer extends EventEmitter {
 
 export async function runAppServerTask({
   command, argsPrefix, configArgs, cwd, env, shell, spawnImpl,
+  codexHomeOptions, onHomeDiagnostic,
   threadId: resumeId = null, expectedTurnId, continuationInputs = [], expectedInitialInputKind, model = "", effort = "", sandbox = "workspace-write", approvalPolicy = "never",
   prompt, imagePath = "", name, timeoutMs = 1_200_000,
   onControl = () => {}, onThread = () => {}, onTurnStarted = () => {}, onOutput = () => {}, onProgress = () => {}, onDiagnostic = () => {},
@@ -165,6 +167,7 @@ export async function runAppServerTask({
   const resumeConflict = () => new Error("会话已有新内容或原轮次未停止，请从当前会话继续。");
   if (expectedTurnId && !resumeId) throw resumeConflict();
   if (continuationInputs.length && !expectedTurnId) throw resumeConflict();
+  env = resolveSessionEnv(env, codexHomeOptions, resumeId, onHomeDiagnostic);
   const rpc = new CodexAppServer({ command, argsPrefix, configArgs, cwd, env, shell, spawnImpl });
   let threadId = resumeId;
   let turnId;

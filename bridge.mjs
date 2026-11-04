@@ -45,6 +45,7 @@ import { buildPanelCard, buildTaskCard } from "./feishu-cards.mjs";
 import { createHistoryReader } from "./codex-history.mjs";
 import { HistoryBrowser } from "./history-browser.mjs";
 import { inspectAttachmentRuntime } from "./thread-attachment.mjs";
+import { resolveCodexHome } from "./codex-home.mjs";
 
 const HOME_CONFIG_DIR = path.join(homedir(), ".feishu-codex-bridge");
 const HOME_CONFIG_PATH = path.join(HOME_CONFIG_DIR, "config.env");
@@ -227,7 +228,14 @@ function readCodexDefaults(codexHome, profile = "") {
   };
 }
 
-const codexHome = resolveProjectPath(optionalEnv("CODEX_HOME", path.join(homedir(), ".codex")), process.cwd());
+const codexHomeOptions = {
+  configuredHome: optionalEnv("CODEX_HOME") ? resolveProjectPath(optionalEnv("CODEX_HOME"), process.cwd()) : "",
+  defaultHome: path.join(homedir(), ".codex"),
+};
+const codexHomeSelection = resolveCodexHome({ ...codexHomeOptions, allowEmpty: true });
+const codexHome = codexHomeSelection.home;
+// Discovery and IPC helpers inherit the same effective directory as task engines.
+process.env.CODEX_HOME = codexHome;
 const configuredCodexProfile = optionalEnv("CODEX_PROFILE");
 const codexDefaults = readCodexDefaults(codexHome, configuredCodexProfile);
 
@@ -237,6 +245,7 @@ const config = {
     appSecret: requiredEnv("FEISHU_APP_SECRET"),
   },
   codex: {
+    homeOptions: codexHomeOptions,
     transport: optionalEnv("CODEX_TASK_TRANSPORT", "desktop"),
     bin: optionalEnv("CODEX_BIN", "codex"),
     model: optionalEnv("CODEX_MODEL"),
@@ -1334,6 +1343,8 @@ class TaskRunner {
         configArgs: this.appServerConfigArgs(task),
         cwd: task.projectPath,
         env: { ...process.env, CODEX_HOME: codexHome },
+        codexHomeOptions: config.codex.homeOptions,
+        onHomeDiagnostic: message => log("warn", "Codex session directory fallback", { taskId: task.taskId, message }),
         threadId,
         preserveThreadPlacement: Boolean(task.attachedThreadId),
         expectedTurnId: task.resumeTurnId,
@@ -2203,7 +2214,22 @@ const wsClient = new WSClient({
   loggerLevel: 2,
 });
 
+if (codexHomeSelection.warning) log("warn", "Codex home fallback", { message: codexHomeSelection.warning });
+if (codexHomeSelection.error) log("error", "Codex session files unavailable", { message: codexHomeSelection.error });
+// Report stale persisted bindings at startup, before the first Feishu task.
+// Keep the bot available so the user can explicitly reset a missing session.
+for (const threadId of new Set([...runner.sessions.values()].filter(session =>
+  session.backend === APP_SERVER_SESSION_BACKEND && session.threadId).map(session => session.threadId))) {
+  try {
+    const resolved = resolveCodexHome({ ...codexHomeOptions, threadId });
+    if (resolved.warning) log("warn", "Codex saved session fallback", { message: resolved.warning });
+  } catch (error) {
+    log("error", "Codex saved session unavailable", { message: error.message, sessionStatePath: config.bridge.sessionStatePath });
+  }
+}
+
 log("info", "starting Feishu Codex bridge", {
+  codexHome,
   configPath: CONFIG_PATH,
   sessionStatePath: config.bridge.sessionStatePath,
   defaultProjectPath: config.bridge.defaultProjectPath,

@@ -7,6 +7,7 @@ import { interruptDesktopTurn, startDesktopTurn, steerDesktopTurn } from "./code
 import { TurnInterrupt } from "./turn-interrupt.mjs";
 import { missingSteeringInputs } from "./steering-context.mjs";
 import { historyProjectPath } from "./codex-history.mjs";
+import { resolveSessionEnv } from "./codex-home.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
@@ -88,7 +89,9 @@ export async function steerDesktopTask({ pipePath, threadId, turnId, prompt, cal
   }
 }
 
-export async function prepareDesktopThread({ command, argsPrefix, configArgs, cwd, env, shell, threadId, model, sandbox, approvalPolicy, name }) {
+export async function prepareDesktopThread({ command, argsPrefix, configArgs, cwd, env, shell, threadId, model, sandbox, approvalPolicy, name,
+  codexHomeOptions, onHomeDiagnostic }) {
+  env = resolveSessionEnv(env, codexHomeOptions, threadId, onHomeDiagnostic);
   const rpc = new CodexAppServer({ command, argsPrefix, configArgs, cwd, env, shell });
   try {
     await rpc.initialize();
